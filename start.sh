@@ -20,6 +20,19 @@ export HF_XET_HIGH_PERFORMANCE=1
 
 mkdir -p /workspace/logs
 
+# ----------------------------------------------------------------------------
+# JupyterLab: sobe logo no inicio, sem senha, para servir como ferramenta
+# de debug em tempo real enquanto o resto do boot roda. A imagem base ja tem
+# o pacote instalado; so precisamos iniciar.
+# ----------------------------------------------------------------------------
+echo "[boot] (0/6) Iniciando JupyterLab na porta 8888..."
+nohup jupyter lab \
+    --ip=0.0.0.0 --port=8888 --allow-root --no-browser \
+    --ServerApp.token='' --ServerApp.password='' \
+    --ServerApp.disable_check_xsrf=True \
+    --ServerApp.root_dir=/workspace \
+    > /workspace/logs/jupyter.log 2>&1 &
+
 echo "[boot] (1/6) Dependencias de sistema..."
 apt-get update -qq
 apt-get install -y -qq \
