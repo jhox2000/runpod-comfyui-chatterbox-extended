@@ -224,7 +224,10 @@ if [ ! -d /workspace/Chatterbox-TTS-Extended ]; then
         torch torchaudio || true
     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-    pip install torchcodec
+    # torchcodec TRAVADO em cu128: a versao solta puxa 0.14+ (compilada p/ CUDA 13,
+    # exige libnvrtc.so.13 inexistente no pod CUDA 12.8) e quebra o salvamento de audio.
+    # Diagnostico completo: DIAGNOSTICO-Chatterbox-CUDA.md (10/jun/2026).
+    pip install "torchcodec==0.11.1" --index-url https://download.pytorch.org/whl/cu128
     python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')"
 
     # ---- PATCH t3.py: desabilitar alignment_stream_analyzer ----
@@ -469,19 +472,19 @@ One Ring to bring them all and in the darkness bind them
 
 In the Land of Mordor where the Shadows lie.""",
         "separate_files_checkbox": False,
-        "export_format_checkboxes": ["flac", "mp3"],
+        "export_format_checkboxes": ["mp3"],
         "disable_watermark_checkbox": True,
         "num_generations_input": 1,
-        "num_candidates_slider": 1,
+        "num_candidates_slider": 3,
         "max_attempts_slider": 2,
-        "bypass_whisper_checkbox": False,
+        "bypass_whisper_checkbox": True,
         "whisper_model_dropdown": "medium (~5–8 GB OpenAI / ~2.5–4.5 GB faster-whisper)",
         "use_faster_whisper_checkbox": True,
         "enable_parallel_checkbox": True,
         "use_longest_transcript_on_fail_checkbox": True,
         "num_parallel_workers_slider": 4,
         "exaggeration_slider": 0.5,
-        "cfg_weight_slider": 1.0,
+        "cfg_weight_slider": 0.5,
         "temp_slider": 0.75,
         "seed_input": 0,
         "enable_batching_checkbox": False,
