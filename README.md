@@ -13,6 +13,8 @@ setup**, a full pipeline for:
 
 Deploy, wait for the first boot, and use it.
 
+**🚀 One-click deploy on RunPod:** [console.runpod.io/deploy?template=0zaglh8t4q](https://console.runpod.io/deploy?template=0zaglh8t4q&ref=58yca06l) — opens the deploy screen with everything pre-configured.
+
 > **Quality default:** all workflows run in **RAW mode** (full steps, no Lightning
 > speed-up) for maximum quality and motion dynamics. The Lightning LoRAs are still
 > downloaded and sit **bypassed** inside the workflows — select the LoRA nodes and
@@ -103,6 +105,10 @@ The Qwen generator has a simpler toggle: flip **"Enable 8 Steps LoRA?"** to `tru
 ---
 
 ## Deploying on RunPod (`start.sh`)
+
+**Easiest path:** use the public template — **[Deploy on RunPod](https://console.runpod.io/deploy?template=0zaglh8t4q&ref=58yca06l)** — it already contains all the settings below. The requirements are listed here for anyone who prefers to build their own template from scratch.
+
+> The template may not show up in the Explore search bar (community templates are indexed slowly there) — the direct link above always works.
 
 **Requirements**
 
