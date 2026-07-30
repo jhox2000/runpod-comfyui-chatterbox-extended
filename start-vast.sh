@@ -21,6 +21,8 @@
 #     bypass (Ctrl+B nos 2 nos de LoRA + KSamplers 4 steps/CFG 1/split 0-2-4
 #     e shift 5 para reativar o modo rapido)
 #   - Editor 2511: 4 steps / CFG 1 (Lightning EMBUTIDO no modelo; nao ha cru)
+#   - Personagens em lote: usa o Editor 2511 CRU (download separado, sem
+#     lightning), 32 steps / CFG 3.0, via /workspace/scripts/batch_characters.py
 # Todos os workflows ja vem em 16:9
 # (imagens 1664x928, videos 832x480).
 # ============================================================================
@@ -48,6 +50,7 @@ apt-get install -y -qq \
     ffmpeg \
     htop tmux build-essential lsof
 pip install -q -U huggingface_hub hf_xet
+pip install -q pillow requests   # usados pelo batch_characters.py (personagens)
 # A imagem base da Vast nao traz PyTorch: instalar a versao cu128 (Blackwell)
 # ANTES do requirements do ComfyUI, para o pip nao escolher um build errado.
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
@@ -167,6 +170,23 @@ PYLORA8
     rm -rf /workspace/_dl_lora8
 fi
 
+# Editor 2511 CRU (sem lightning): checagem PROPRIA, separada do bloco Qwen.
+# Usado SOMENTE pelo lote com personagens (batch_characters.py), que roda em
+# modo cru para qualidade maxima. O workflow manual "3 - Editar Rosto" segue
+# intocado com a versao lightning. ~20GB adicionais.
+if [ ! -f /workspace/ComfyUI/models/diffusion_models/qwen_image_edit_2511_fp8_e4m3fn.safetensors ]; then
+    echo "[boot] (4/6) Baixando Editor 2511 CRU para o lote de personagens (~20GB)..."
+    mkdir -p /workspace/ComfyUI/models/diffusion_models
+    python3 - << 'PYEDITRAW'
+from huggingface_hub import hf_hub_download
+hf_hub_download(repo_id='Comfy-Org/Qwen-Image-Edit_ComfyUI',
+    filename='split_files/diffusion_models/qwen_image_edit_2511_fp8_e4m3fn.safetensors',
+    local_dir='/workspace/_dl_editraw')
+PYEDITRAW
+    mv /workspace/_dl_editraw/split_files/diffusion_models/qwen_image_edit_2511_fp8_e4m3fn.safetensors /workspace/ComfyUI/models/diffusion_models/
+    rm -rf /workspace/_dl_editraw
+fi
+
 # Custom nodes: clone condicional (o volume persiste), pip install SEMPRE
 # (mesmo motivo do passo 2/6: container efemero perde os pacotes pip).
 
@@ -225,6 +245,496 @@ cat > "$WF_DIR/5 - Gerar Videos em Lote (Wan).json" << 'WORKFLOW_EOF_BATCHVID'
 WORKFLOW_EOF_BATCHVID
 
 
+
+# ----------------------------------------------------------------------------
+# (5.5/6) LOTE COM PERSONAGENS CONSISTENTES (rosto + roupa fixos)
+#   Sistema ADITIVO: nada dos 5 workflows acima muda. Componentes novos:
+#     - /workspace/characters/           -> referencias (ex.: daniel_1.png) e
+#                                           cadastro opcional characters.json
+#     - /workspace/scripts/batch_characters.py -> orquestrador do lote
+#   Uso (terminal do Jupyter):
+#     python /workspace/scripts/batch_characters.py /workspace/projeto.txt
+#   TXT: tags [Nome] ou [Nome:2] no inicio da linha ([Daniel] = daniel_1.png).
+#   Linha sem tag -> Qwen-2512 normal. 1-3 tags -> Edit 2511 CRU. 4+ -> duas
+#   passadas (ou --sheet-mode). Flags: --resume --seed --ar --variants
+#   --steps --cfg. Saida: ComfyUI/output/characters_batch/RUN_<data>/
+# ----------------------------------------------------------------------------
+echo "[boot] (5.5/6) Instalando sistema de personagens consistentes..."
+mkdir -p /workspace/characters /workspace/scripts
+cat > /workspace/scripts/batch_characters.py << 'PYEOF_CHARBATCH'
+#!/usr/bin/env python3
+# ============================================================================
+# batch_characters.py — Lote com PERSONAGENS CONSISTENTES (rosto + roupa fixos)
+# ----------------------------------------------------------------------------
+# Le um TXT (1 prompt por linha) com tags [Nome] ou [Nome:2] no inicio da
+# linha e roteia cada linha automaticamente:
+#   - sem tag        -> Qwen-Image-2512 (geracao normal, igual ao lote atual)
+#   - 1 a 3 tags     -> Qwen-Edit-2511 CRU com referencias (rota A)
+#   - 4+ tags        -> duas passadas no Edit (rota B) ou folha de referencia
+#                       unica (--sheet-mode)
+#
+# Personagens: /workspace/characters/nome_1.png (variante 1 = roupa 1, etc).
+# [Daniel] equivale a [Daniel:1]. Cadastro opcional: characters.json
+# (gender / descriptor / wardrobe por variante) na mesma pasta.
+#
+# Uso:  python /workspace/scripts/batch_characters.py /workspace/projeto.txt
+# Flags: --resume --seed N --ar 16:9|9:16|1:1|4:3|3:4 --sheet-mode
+#        --variants N --steps N --cfg X
+# Saida: /workspace/ComfyUI/output/characters_batch/RUN_<data>/ + relatorio
+#        batch_report.txt + contact_sheet.jpg (mosaico de revisao)
+# ============================================================================
+import argparse, hashlib, json, os, random, re, shutil, sys, time
+import urllib.request
+from PIL import Image
+
+API       = "http://127.0.0.1:8188"
+COMFY     = "/workspace/ComfyUI"
+CHAR_DIR  = "/workspace/characters"
+REF_SUB   = "_charrefs"                       # subpasta dentro de ComfyUI/input
+REF_DIR   = os.path.join(COMFY, "input", REF_SUB)
+OUT_ROOT  = os.path.join(COMFY, "output", "characters_batch")
+GEN_MODEL = "qwen_image_2512_fp8_e4m3fn.safetensors"
+EDIT_MODEL = "qwen_image_edit_2511_fp8_e4m3fn.safetensors"   # versao CRUA (sem lightning)
+CLIP_NAME = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+VAE_NAME  = "qwen_image_vae.safetensors"
+
+ASPECTS = {"16:9": (1664, 928), "9:16": (928, 1664), "1:1": (1328, 1328),
+           "4:3": (1472, 1104), "3:4": (1104, 1472)}
+NEG_BASE = ("低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，"
+            "人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲")
+NEG_SOLO = ", extra person, duplicate person, twin, clone of the same person"
+CROWD_WORDS = ("crowd", "people", "guests", "group", "couple", "family", "men",
+               "women", "children", "kids", "audience", "dancers", "strangers",
+               "bystanders", "team", "soldiers", "villagers", "passengers",
+               "students", "workers", "waiters", "congregation", "party",
+               "pedestrians", "onlookers", "gathering", "everyone", "others")
+TAGS_RE = re.compile(r"^\s*((?:\[[^\[\]]+\]\s*)*)(.*)$")
+ONE_TAG = re.compile(r"\[([^\[\]:]+?)(?:\s*:\s*(\d+))?\]")
+
+# ---------------------------------------------------------------- API helpers
+def api_post(path, payload):
+    req = urllib.request.Request(API + path, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=60).read())
+
+def api_get(path):
+    return json.loads(urllib.request.urlopen(API + path, timeout=60).read())
+
+def submit_and_wait(graph, timeout=2400):
+    """Envia um grafo para a fila do ComfyUI e espera terminar.
+    Retorna a lista de imagens salvas [(filename, subfolder), ...]."""
+    pid = api_post("/prompt", {"prompt": graph})["prompt_id"]
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(2.5)
+        try:
+            hist = api_get(f"/history/{pid}")
+        except Exception:
+            continue
+        if pid not in hist:
+            continue
+        item = hist[pid]
+        status = item.get("status", {})
+        if status.get("status_str") == "error":
+            raise RuntimeError("ComfyUI retornou erro na geracao")
+        imgs = []
+        for node_out in item.get("outputs", {}).values():
+            for im in node_out.get("images", []):
+                if im.get("type") == "output":
+                    imgs.append((im["filename"], im.get("subfolder", "")))
+        if imgs or status.get("completed"):
+            return imgs
+    raise TimeoutError("timeout esperando a geracao no ComfyUI")
+
+# ------------------------------------------------------------------- grafos
+def graph_t2i(prompt, w, h, seed, prefix):
+    """Rota 0: texto -> imagem no Qwen-Image-2512 (modo cru, igual ao lote atual)."""
+    return {
+        "1": {"class_type": "CLIPLoader", "inputs": {
+            "clip_name": CLIP_NAME, "type": "qwen_image", "device": "default"}},
+        "2": {"class_type": "UNETLoader", "inputs": {
+            "unet_name": GEN_MODEL, "weight_dtype": "default"}},
+        "3": {"class_type": "ModelSamplingAuraFlow", "inputs": {
+            "shift": 3.1, "model": ["2", 0]}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": VAE_NAME}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {
+            "text": prompt, "clip": ["1", 0]}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {
+            "text": NEG_BASE, "clip": ["1", 0]}},
+        "7": {"class_type": "EmptySD3LatentImage", "inputs": {
+            "width": w, "height": h, "batch_size": 1}},
+        "8": {"class_type": "KSampler", "inputs": {
+            "seed": seed, "steps": 20, "cfg": 2.5, "sampler_name": "euler",
+            "scheduler": "simple", "denoise": 1.0, "model": ["3", 0],
+            "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0]}},
+        "9": {"class_type": "VAEDecode", "inputs": {
+            "samples": ["8", 0], "vae": ["4", 0]}},
+        "10": {"class_type": "SaveImage", "inputs": {
+            "filename_prefix": prefix, "images": ["9", 0]}},
+    }
+
+def graph_edit(prompt, neg, ref_files, w, h, seed, steps, cfg, prefix):
+    """Rotas A/B: referencias + prompt no Qwen-Edit-2511 CRU (ate 3 imagens)."""
+    g = {
+        "1": {"class_type": "CLIPLoader", "inputs": {
+            "clip_name": CLIP_NAME, "type": "qwen_image", "device": "default"}},
+        "2": {"class_type": "UNETLoader", "inputs": {
+            "unet_name": EDIT_MODEL, "weight_dtype": "default"}},
+        "3": {"class_type": "ModelSamplingAuraFlow", "inputs": {
+            "shift": 3.0, "model": ["2", 0]}},
+        "3b": {"class_type": "CFGNorm", "inputs": {
+            "strength": 1.0, "model": ["3", 0]}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": VAE_NAME}},
+        "7": {"class_type": "EmptySD3LatentImage", "inputs": {
+            "width": w, "height": h, "batch_size": 1}},
+    }
+    pos = {"clip": ["1", 0], "vae": ["4", 0], "prompt": prompt}
+    ngi = {"clip": ["1", 0], "vae": ["4", 0], "prompt": neg}
+    for i, fn in enumerate(ref_files[:3], start=1):
+        nid = "L%d" % i
+        g[nid] = {"class_type": "LoadImage", "inputs": {"image": fn}}
+        pos["image%d" % i] = [nid, 0]
+        ngi["image%d" % i] = [nid, 0]
+    g["5"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": pos}
+    g["6"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": ngi}
+    g["8"] = {"class_type": "KSampler", "inputs": {
+        "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler",
+        "scheduler": "simple", "denoise": 1.0, "model": ["3b", 0],
+        "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0]}}
+    g["9"] = {"class_type": "VAEDecode", "inputs": {
+        "samples": ["8", 0], "vae": ["4", 0]}}
+    g["10"] = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": prefix, "images": ["9", 0]}}
+    return g
+
+# ------------------------------------------------------------ personagens
+def load_registry():
+    path = os.path.join(CHAR_DIR, "characters.json")
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return {k.lower(): v for k, v in json.load(f).items()}
+        except Exception as e:
+            print(f"[aviso] characters.json invalido ({e}); seguindo sem cadastro.")
+    return {}
+
+def find_ref(name, variant):
+    """Localiza a imagem de referencia nome_variante.* (variante 1 aceita
+    tambem o arquivo sem sufixo, ex.: daniel.png)."""
+    exts = (".png", ".jpg", ".jpeg", ".webp")
+    cands = ["%s_%d%s" % (name, variant, e) for e in exts]
+    if variant == 1:
+        cands += ["%s%s" % (name, e) for e in exts]
+    for c in cands:
+        p = os.path.join(CHAR_DIR, c)
+        if os.path.isfile(p):
+            return p
+    return None
+
+def prep_ref(src, name, variant):
+    """Copia a referencia para ComfyUI/input/_charrefs, reduzida a <=1024px."""
+    os.makedirs(REF_DIR, exist_ok=True)
+    dst_name = "%s_%d.png" % (name, variant)
+    dst = os.path.join(REF_DIR, dst_name)
+    if not os.path.isfile(dst) or os.path.getmtime(dst) < os.path.getmtime(src):
+        img = Image.open(src).convert("RGB")
+        img.thumbnail((1024, 1024), Image.LANCZOS)
+        img.save(dst, "PNG")
+    return REF_SUB + "/" + dst_name
+
+def anchor(name, variant, img_idx, registry):
+    meta = registry.get(name, {})
+    desc = meta.get("descriptor") or meta.get("gender") or "person"
+    txt = "the %s from image %d" % (desc, img_idx)
+    ward = meta.get("wardrobe")
+    if isinstance(ward, dict):
+        ward = ward.get(str(variant))
+    if ward:
+        txt += " (wearing %s)" % ward
+    return txt
+
+def join_anchors(items):
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+def build_prompt(anchors, scene):
+    return ("Photorealistic scene. %s: %s. Natural skin texture, realistic "
+            "lighting, photorealistic, high detail."
+            % (join_anchors(anchors).capitalize(), scene.rstrip(". ")))
+
+def build_neg(scene):
+    low = scene.lower()
+    if any(w in low for w in CROWD_WORDS):
+        return NEG_BASE            # cena com multidao: sem bloqueio de "extra person"
+    return NEG_BASE + NEG_SOLO
+
+# ----------------------------------------------------------------- parsing
+def parse_line(raw):
+    m = TAGS_RE.match(raw)
+    tags_blob, rest = m.group(1) or "", (m.group(2) or "").strip()
+    tags = [(t[0].strip().lower(), int(t[1]) if t[1] else 1)
+            for t in ONE_TAG.findall(tags_blob)]
+    return tags, rest
+
+def slug(tags):
+    return "_".join("%s%s" % (n, v if v != 1 else "") for n, v in tags) or "cena"
+
+# -------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description="Lote com personagens consistentes")
+    ap.add_argument("txt", help="arquivo TXT com 1 prompt por linha")
+    ap.add_argument("--ar", default="16:9", choices=sorted(ASPECTS))
+    ap.add_argument("--seed", type=int, default=None,
+                    help="seed base fixa (reprodutivel); sem flag = aleatoria")
+    ap.add_argument("--steps", type=int, default=32, help="steps do Edit (padrao 32)")
+    ap.add_argument("--cfg", type=float, default=3.0, help="CFG do Edit (padrao 3.0)")
+    ap.add_argument("--variants", type=int, default=2,
+                    help="variacoes por cena com 4+ personagens (padrao 2)")
+    ap.add_argument("--sheet-mode", action="store_true",
+                    help="4+ personagens via folha de referencia unica (plano B)")
+    ap.add_argument("--resume", action="store_true",
+                    help="continua um lote interrompido do mesmo TXT")
+    args = ap.parse_args()
+
+    if not os.path.isfile(args.txt):
+        sys.exit(f"ERRO: arquivo nao encontrado: {args.txt}")
+    try:
+        api_get("/system_stats")
+    except Exception:
+        sys.exit("ERRO: ComfyUI nao respondeu em %s — confira se ele terminou de subir "
+                 "(tail -f /workspace/logs/comfyui.log)" % API)
+    if not os.path.isfile(os.path.join(COMFY, "models", "diffusion_models", EDIT_MODEL)):
+        sys.exit("ERRO: modelo %s nao encontrado — o boot terminou de baixar tudo?" % EDIT_MODEL)
+
+    w, h = ASPECTS[args.ar]
+    registry = load_registry()
+
+    # checkpoint (por TXT): permite --resume apos queda de pod
+    os.makedirs(OUT_ROOT, exist_ok=True)
+    ckpt_path = os.path.join(OUT_ROOT, ".ckpt_%s.json"
+                             % hashlib.md5(os.path.abspath(args.txt).encode()).hexdigest()[:10])
+    ckpt = {"run": None, "done": []}
+    if args.resume and os.path.isfile(ckpt_path):
+        with open(ckpt_path, encoding="utf-8") as f:
+            ckpt = json.load(f)
+        print(f"[resume] retomando a rodada {ckpt['run']} ({len(ckpt['done'])} linhas ja prontas)")
+    if not ckpt["run"]:
+        ckpt["run"] = time.strftime("RUN_%Y-%m-%d_%H%M%S")
+    run = ckpt["run"]
+    done = set(ckpt["done"])
+    run_dir = os.path.join(OUT_ROOT, run)
+
+    def save_ckpt():
+        with open(ckpt_path, "w", encoding="utf-8") as f:
+            json.dump({"run": run, "done": sorted(done)}, f)
+
+    # ler e classificar as linhas
+    with open(args.txt, encoding="utf-8") as f:
+        raw_lines = [l.rstrip("\n") for l in f]
+    tasks = []
+    report = []
+    for i, raw in enumerate(raw_lines, start=1):
+        if not raw.strip():
+            continue
+        tags, scene = parse_line(raw)
+        if tags and not scene:
+            report.append((i, "PULADA", "linha so com tag, sem prompt"))
+            continue
+        missing = [("%s:%d" % (n, v)) for n, v in tags if not find_ref(n, v)]
+        if missing:
+            report.append((i, "PULADA", "referencia inexistente: " + ", ".join(missing)))
+            continue
+        tasks.append((i, tags, scene))
+
+    # agrupar por modelo (evita trocar checkpoint a cada linha); a numeracao
+    # dos arquivos preserva a ordem do projeto no disco.
+    tasks.sort(key=lambda t: (len(t[1]) > 0, t[0]))
+    total = len(tasks)
+    print(f"[lote] {total} linhas validas | rodada {run} | {args.ar} {w}x{h} | "
+          f"edit {args.steps} steps / cfg {args.cfg}")
+
+    base_seed = args.seed if args.seed is not None else random.randrange(2**31)
+
+    for k, (lineno, tags, scene) in enumerate(tasks, start=1):
+        if lineno in done:
+            continue
+        seed = (base_seed + lineno * 1000) % (2**63)
+        label = slug(tags)
+        prefix = "characters_batch/%s/%04d_%s" % (run, lineno, label)
+        t0 = time.time()
+        try:
+            if not tags:
+                # ------------------------------------------------ rota 0
+                print(f"[{k}/{total}] linha {lineno} | rota 0 (sem personagem)")
+                submit_and_wait(graph_t2i(scene, w, h, seed, prefix))
+            else:
+                refs = [prep_ref(find_ref(n, v), n, v) for n, v in tags]
+                if len(tags) <= 3:
+                    # -------------------------------------------- rota A
+                    print(f"[{k}/{total}] linha {lineno} | rota A ({len(tags)} personagem/ns)")
+                    ancs = [anchor(n, v, i + 1, registry) for i, (n, v) in enumerate(tags)]
+                    submit_and_wait(graph_edit(
+                        build_prompt(ancs, scene), build_neg(scene),
+                        refs, w, h, seed, args.steps, args.cfg, prefix))
+                elif args.sheet_mode:
+                    # ------------------------- rota B (folha de referencia)
+                    print(f"[{k}/{total}] linha {lineno} | rota B-folha ({len(tags)} personagens)")
+                    sheet = make_sheet(tags, lineno)
+                    ancs = ["person %d from the reference sheet%s" %
+                            (i + 1, wardrobe_suffix(n, v, registry))
+                            for i, (n, v) in enumerate(tags)]
+                    for var in range(args.variants):
+                        submit_and_wait(graph_edit(
+                            build_prompt(ancs, scene), build_neg(scene),
+                            [sheet], w, h, seed + var * 777,
+                            args.steps, args.cfg, prefix + "_v%d" % (var + 1)))
+                else:
+                    # ---------------------------- rota B (duas passadas)
+                    print(f"[{k}/{total}] linha {lineno} | rota B-2passadas ({len(tags)} personagens)")
+                    for var in range(args.variants):
+                        vseed = seed + var * 777
+                        # passada 1: os 3 primeiros (fidelidade maxima)
+                        head, tail = tags[:3], tags[3:]
+                        ancs = [anchor(n, v, i + 1, registry) for i, (n, v) in enumerate(head)]
+                        p1 = "characters_batch/%s/tmp_%04d_v%d_p1" % (run, lineno, var + 1)
+                        imgs = submit_and_wait(graph_edit(
+                            build_prompt(ancs, scene), build_neg(scene),
+                            refs[:3], w, h, vseed, args.steps, args.cfg, p1))
+                        scene_file = stage_output(imgs[0], lineno, var)
+                        # passadas seguintes: insere os demais, 2 por vez
+                        idx = 0
+                        while tail:
+                            grp, tail = tail[:2], tail[2:]
+                            g_refs = [scene_file] + [refs[3 + idx + j] for j in range(len(grp))]
+                            g_anc = [anchor(n, v, j + 2, registry) for j, (n, v) in enumerate(grp)]
+                            add_prompt = ("Add %s to this scene, standing naturally with the "
+                                          "group. Keep the existing people, their faces, the "
+                                          "composition and the lighting unchanged. Photorealistic, "
+                                          "natural skin texture." % join_anchors(g_anc))
+                            last = not tail
+                            pfx = (prefix + "_v%d" % (var + 1)) if last else \
+                                  "characters_batch/%s/tmp_%04d_v%d_p%d" % (run, lineno, var + 1, idx + 2)
+                            imgs = submit_and_wait(graph_edit(
+                                add_prompt, NEG_BASE, g_refs, w, h,
+                                vseed + idx + 1, args.steps, args.cfg, pfx))
+                            if not last:
+                                scene_file = stage_output(imgs[0], lineno, var)
+                            idx += len(grp)
+            done.add(lineno)
+            save_ckpt()
+            report.append((lineno, "OK", "seed %d | %.0fs" % (seed, time.time() - t0)))
+        except Exception as e:
+            # 1 retry automatico antes de marcar falha
+            try:
+                print(f"    [retry] linha {lineno}: {e}")
+                time.sleep(5)
+                if not tags:
+                    submit_and_wait(graph_t2i(scene, w, h, seed + 1, prefix))
+                else:
+                    refs = [prep_ref(find_ref(n, v), n, v) for n, v in tags]
+                    ancs = [anchor(n, v, i + 1, registry) for i, (n, v) in enumerate(tags[:3])]
+                    submit_and_wait(graph_edit(
+                        build_prompt(ancs, scene), build_neg(scene),
+                        refs[:3], w, h, seed + 1, args.steps, args.cfg, prefix))
+                done.add(lineno)
+                save_ckpt()
+                report.append((lineno, "OK (retry)", "seed %d" % (seed + 1)))
+            except Exception as e2:
+                report.append((lineno, "FALHOU", str(e2)[:160]))
+                print(f"    [falha] linha {lineno}: {e2}")
+
+    # limpeza dos temporarios das duas passadas
+    if os.path.isdir(run_dir):
+        for f in os.listdir(run_dir):
+            if f.startswith("tmp_"):
+                try: os.remove(os.path.join(run_dir, f))
+                except OSError: pass
+
+    write_report(run_dir, report, args)
+    make_contact_sheet(run_dir)
+    ok = sum(1 for _, s, _ in report if s.startswith("OK"))
+    print(f"\n[fim] {ok} geradas | {len(report) - ok} puladas/falhas")
+    print(f"[fim] imagens:   {run_dir}")
+    print(f"[fim] relatorio: {os.path.join(run_dir, 'batch_report.txt')}")
+
+# ------------------------------------------------------------- auxiliares
+def wardrobe_suffix(name, variant, registry):
+    ward = registry.get(name, {}).get("wardrobe")
+    if isinstance(ward, dict):
+        ward = ward.get(str(variant))
+    return " (wearing %s)" % ward if ward else ""
+
+def stage_output(img, lineno, var):
+    """Copia uma imagem gerada (output) para input/_charrefs para servir de
+    base da proxima passada."""
+    fn, sub = img
+    src = os.path.join(COMFY, "output", sub, fn)
+    os.makedirs(REF_DIR, exist_ok=True)
+    dst_name = "scene_%04d_v%d.png" % (lineno, var + 1)
+    shutil.copyfile(src, os.path.join(REF_DIR, dst_name))
+    return REF_SUB + "/" + dst_name
+
+def make_sheet(tags, lineno):
+    """Monta a folha de referencia horizontal (768px por rosto, numerada)."""
+    os.makedirs(REF_DIR, exist_ok=True)
+    tiles = []
+    for n, v in tags:
+        img = Image.open(find_ref(n, v)).convert("RGB")
+        img.thumbnail((768, 768), Image.LANCZOS)
+        tiles.append(img)
+    hgt = max(t.height for t in tiles)
+    sheet = Image.new("RGB", (sum(t.width for t in tiles), hgt), "white")
+    x = 0
+    for t in tiles:
+        sheet.paste(t, (x, (hgt - t.height) // 2))
+        x += t.width
+    name = "sheet_%04d.png" % lineno
+    sheet.save(os.path.join(REF_DIR, name), "PNG")
+    return REF_SUB + "/" + name
+
+def write_report(run_dir, report, args):
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "batch_report.txt"), "w", encoding="utf-8") as f:
+        f.write("Lote com personagens — relatorio\n")
+        f.write("ar=%s | edit steps=%d cfg=%.1f | variants=%d | sheet=%s\n\n"
+                % (args.ar, args.steps, args.cfg, args.variants, args.sheet_mode))
+        for lineno, status, info in sorted(report):
+            f.write("linha %04d  %-11s %s\n" % (lineno, status, info))
+
+def make_contact_sheet(run_dir, cols=6, thumb=256):
+    """Mosaico de miniaturas de toda a rodada para revisao rapida."""
+    if not os.path.isdir(run_dir):
+        return
+    files = sorted(f for f in os.listdir(run_dir) if f.lower().endswith(".png"))
+    if not files:
+        return
+    thumbs = []
+    for fn in files:
+        try:
+            im = Image.open(os.path.join(run_dir, fn)).convert("RGB")
+            im.thumbnail((thumb, thumb), Image.LANCZOS)
+            thumbs.append(im)
+        except Exception:
+            pass
+    if not thumbs:
+        return
+    rows = (len(thumbs) + cols - 1) // cols
+    cw = max(t.width for t in thumbs)
+    ch = max(t.height for t in thumbs)
+    sheet = Image.new("RGB", (cols * cw, rows * ch), "black")
+    for i, t in enumerate(thumbs):
+        sheet.paste(t, ((i % cols) * cw, (i // cols) * ch))
+    sheet.save(os.path.join(run_dir, "contact_sheet.jpg"), "JPEG", quality=88)
+
+if __name__ == "__main__":
+    main()
+PYEOF_CHARBATCH
+chmod +x /workspace/scripts/batch_characters.py
+
+cat > "$WF_DIR/6 - Personagens em Lote (leia-me).json" << 'WORKFLOW_EOF_CHARNOTE'
+{"id":"char-batch-note-0001","revision":0,"last_node_id":1,"last_link_id":0,"nodes":[{"id":1,"type":"MarkdownNote","pos":[0,0],"size":[620,900],"flags":{},"order":0,"mode":0,"inputs":[],"outputs":[],"title":"Personagens em Lote — como usar","properties":{},"widgets_values":["## Personagens em Lote (rosto + roupa fixos)\n\nEste recurso NAO roda por este workflow: ele roda por um comando no\nterminal do Jupyter. Este cartao e so o manual.\n\n**1) Cadastrar os personagens**\nJupyterLab -> pasta `/workspace/characters/` -> suba as referencias:\n`daniel_1.png`, `daniel_2.png`, `sabrina_1.png` ...\n(`nome_variante` = mesma pessoa com outra roupa; minusculas, sem acento)\n\nReferencia ideal: MEIO CORPO, rosto frontal/3-4, fundo neutro, 1 pessoa so.\nDica: gere a referencia no workflow \"2 - Gerar Imagem\" e crie as variantes\nde roupa no \"3 - Editar Rosto\" (\"change his coat to a gray hoodie, keep\neverything else identical\").\n\n**2) (Recomendado) characters.json na mesma pasta**\n```\n{\n  \"daniel\": {\n    \"gender\": \"man\",\n    \"descriptor\": \"middle-aged man with short gray hair\",\n    \"wardrobe\": { \"1\": \"black winter coat\", \"2\": \"gray hoodie\" }\n  }\n}\n```\n\n**3) O TXT (1 prompt por linha, em INGLES)**\n```\n[Daniel] walking down a deserted street at night, heavy rain\n[Daniel:2][Sabrina] arguing in the kitchen, tense atmosphere\na grand gala ball, hundreds of elegant guests dancing\n```\nREGRA DE OURO: na linha com tag, descreva ACAO/CENARIO/LUZ.\nNAO reapresente o personagem (\"[Daniel] a man walking...\" gera um\nsegundo homem parecido na cena).\n\n**4) Rodar (terminal do Jupyter)**\n```\npython /workspace/scripts/batch_characters.py /workspace/projeto.txt\n```\nFlags: `--resume` (retoma lote interrompido) | `--seed N` | `--ar 9:16` |\n`--variants N` | `--sheet-mode` | `--steps N` | `--cfg X`\n\n**5) Resultado**\n`ComfyUI/output/characters_batch/RUN_<data>/` ->\nimagens `0001_daniel.png`..., `batch_report.txt` e `contact_sheet.jpg`\n(mosaico para revisar tudo de uma olhada).\n\nRotas: sem tag -> Qwen-2512 normal | 1-3 tags -> Edit 2511 CRU\n(32 steps / CFG 3.0) | 4+ tags -> duas passadas com 2 variacoes."],"color":"#432","bgcolor":"#653"}],"links":[],"groups":[],"config":{},"extra":{},"version":0.4}
+WORKFLOW_EOF_CHARNOTE
 
 # ----------------------------------------------------------------------------
 # (6/6) Subir o servico
