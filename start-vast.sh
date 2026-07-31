@@ -187,6 +187,20 @@ PYEDITRAW
     rm -rf /workspace/_dl_editraw
 fi
 
+# Modelo de upscale 4x-UltraSharp: checagem PROPRIA. Usado pela passada
+# automatica de nitidez do lote de personagens (upscaled_2x/). ~67MB.
+if [ ! -f /workspace/ComfyUI/models/upscale_models/4x-UltraSharp.pth ]; then
+    echo "[boot] (4/6) Baixando modelo de upscale 4x-UltraSharp (~67MB)..."
+    mkdir -p /workspace/ComfyUI/models/upscale_models
+    python3 - << 'PYUPSCALE'
+from huggingface_hub import hf_hub_download
+hf_hub_download(repo_id='lokCX/4x-Ultrasharp',
+    filename='4x-UltraSharp.pth', local_dir='/workspace/_dl_upscale')
+PYUPSCALE
+    mv /workspace/_dl_upscale/4x-UltraSharp.pth /workspace/ComfyUI/models/upscale_models/
+    rm -rf /workspace/_dl_upscale
+fi
+
 # Custom nodes: clone condicional (o volume persiste), pip install SEMPRE
 # (mesmo motivo do passo 2/6: container efemero perde os pacotes pip).
 
@@ -303,6 +317,9 @@ ASPECTS = {"16:9": (1664, 928), "9:16": (928, 1664), "1:1": (1328, 1328),
 NEG_BASE = ("低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，"
             "人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲")
 NEG_SOLO = ", extra person, duplicate person, twin, clone of the same person"
+QUALITY = ("Extreme clarity, sharp focus, high detail, realistic lighting, "
+           "removing all noise and grain, removing all blur, ultra-smooth "
+           "high definition, photorealistic, drawn with 32K pixel precision.")
 CROWD_WORDS = ("crowd", "people", "guests", "group", "couple", "family", "men",
                "women", "children", "kids", "audience", "dancers", "strangers",
                "bystanders", "team", "soldiers", "villagers", "passengers",
@@ -358,13 +375,13 @@ def graph_t2i(prompt, w, h, seed, prefix):
             "shift": 3.1, "model": ["2", 0]}},
         "4": {"class_type": "VAELoader", "inputs": {"vae_name": VAE_NAME}},
         "5": {"class_type": "CLIPTextEncode", "inputs": {
-            "text": prompt, "clip": ["1", 0]}},
+            "text": prompt.rstrip(". ") + ". " + QUALITY, "clip": ["1", 0]}},
         "6": {"class_type": "CLIPTextEncode", "inputs": {
             "text": NEG_BASE, "clip": ["1", 0]}},
         "7": {"class_type": "EmptySD3LatentImage", "inputs": {
             "width": w, "height": h, "batch_size": 1}},
         "8": {"class_type": "KSampler", "inputs": {
-            "seed": seed, "steps": 20, "cfg": 2.5, "sampler_name": "euler",
+            "seed": seed, "steps": 28, "cfg": 2.5, "sampler_name": "euler",
             "scheduler": "simple", "denoise": 1.0, "model": ["3", 0],
             "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0]}},
         "9": {"class_type": "VAEDecode", "inputs": {
@@ -419,12 +436,13 @@ def load_registry():
     return {}
 
 def find_ref(name, variant):
-    """Localiza a imagem de referencia nome_variante.* (variante 1 aceita
-    tambem o arquivo sem sufixo, ex.: daniel.png)."""
+    """Localiza a referencia "nome (variante).*" (padrao F2 do Windows),
+    aceitando tambem nome_variante.* e, para a variante 1, nome.*"""
     exts = (".png", ".jpg", ".jpeg", ".webp")
-    cands = ["%s_%d%s" % (name, variant, e) for e in exts]
+    cands  = ["%s (%d)%s" % (name, variant, e) for e in exts]   # daniel (1).png
+    cands += ["%s_%d%s" % (name, variant, e) for e in exts]     # daniel_1.png
     if variant == 1:
-        cands += ["%s%s" % (name, e) for e in exts]
+        cands += ["%s%s" % (name, e) for e in exts]             # daniel.png
     for c in cands:
         p = os.path.join(CHAR_DIR, c)
         if os.path.isfile(p):
@@ -459,9 +477,8 @@ def join_anchors(items):
     return ", ".join(items[:-1]) + " and " + items[-1]
 
 def build_prompt(anchors, scene):
-    return ("Photorealistic scene. %s: %s. Natural skin texture, realistic "
-            "lighting, photorealistic, high detail."
-            % (join_anchors(anchors).capitalize(), scene.rstrip(". ")))
+    return ("Photorealistic scene. %s: %s. Natural skin texture. %s"
+            % (join_anchors(anchors).capitalize(), scene.rstrip(". "), QUALITY))
 
 def build_neg(scene):
     low = scene.lower()
@@ -732,8 +749,122 @@ if __name__ == "__main__":
 PYEOF_CHARBATCH
 chmod +x /workspace/scripts/batch_characters.py
 
+mkdir -p /workspace/upscale/entrada /workspace/upscale/saida
+cat > /workspace/scripts/upscale.py << 'PYEOF_UPSCALE'
+#!/usr/bin/env python3
+# ============================================================================
+# upscale.py — Nitidez 2x SELETIVA (4x-UltraSharp) com pasta fixa
+# ----------------------------------------------------------------------------
+# Fluxo: jogue as imagens aprovadas em /workspace/upscale/entrada (arraste e
+# solte no JupyterLab), rode este script, e as versoes nitidas em dobro de
+# resolucao aparecem em /workspace/upscale/saida.
+#
+#   /venv/main/bin/python /workspace/scripts/upscale.py
+#
+# - A entrada NAO e apagada (limpe quando quiser)
+# - Imagens que ja tem versao na saida sao puladas (pode rodar de novo)
+# - Aceita .png .jpg .jpeg .webp de qualquer origem
+# ============================================================================
+import json, os, shutil, sys, time
+import urllib.request
+
+API      = "http://127.0.0.1:8188"
+COMFY    = "/workspace/ComfyUI"
+IN_DIR   = "/workspace/upscale/entrada"
+OUT_DIR  = "/workspace/upscale/saida"
+STAGE    = os.path.join(COMFY, "input", "_upscale_src.png")
+TMP_SUB  = "upscale_tmp"
+MODEL    = "4x-UltraSharp.pth"
+EXTS     = (".png", ".jpg", ".jpeg", ".webp")
+
+def api_post(path, payload):
+    req = urllib.request.Request(API + path, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=60).read())
+
+def api_get(path):
+    return json.loads(urllib.request.urlopen(API + path, timeout=60).read())
+
+def graph(prefix):
+    return {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "_upscale_src.png"}},
+        "2": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": MODEL}},
+        "3": {"class_type": "ImageUpscaleWithModel", "inputs": {
+            "upscale_model": ["2", 0], "image": ["1", 0]}},
+        "4": {"class_type": "ImageScaleBy", "inputs": {
+            "upscale_method": "lanczos", "scale_by": 0.5, "image": ["3", 0]}},
+        "5": {"class_type": "SaveImage", "inputs": {
+            "filename_prefix": prefix, "images": ["4", 0]}},
+    }
+
+def run_one(prefix, timeout=600):
+    pid = api_post("/prompt", {"prompt": graph(prefix)})["prompt_id"]
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(1.5)
+        try:
+            hist = api_get(f"/history/{pid}")
+        except Exception:
+            continue
+        if pid not in hist:
+            continue
+        item = hist[pid]
+        if item.get("status", {}).get("status_str") == "error":
+            raise RuntimeError("ComfyUI retornou erro no upscale")
+        for node_out in item.get("outputs", {}).values():
+            for im in node_out.get("images", []):
+                if im.get("type") == "output":
+                    return os.path.join(COMFY, "output",
+                                        im.get("subfolder", ""), im["filename"])
+    raise TimeoutError("timeout no upscale")
+
+def main():
+    os.makedirs(IN_DIR, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    try:
+        api_get("/system_stats")
+    except Exception:
+        sys.exit("ERRO: ComfyUI nao respondeu — confira se ele terminou de subir "
+                 "(tail -f /workspace/logs/comfyui.log)")
+    if not os.path.isfile(os.path.join(COMFY, "models", "upscale_models", MODEL)):
+        sys.exit("ERRO: modelo %s nao encontrado — rode o start-vast.sh atualizado" % MODEL)
+
+    files = sorted(f for f in os.listdir(IN_DIR)
+                   if f.lower().endswith(EXTS) and
+                   os.path.isfile(os.path.join(IN_DIR, f)))
+    if not files:
+        sys.exit("Nada para fazer: coloque as imagens em %s" % IN_DIR)
+
+    todo = [f for f in files
+            if not os.path.isfile(os.path.join(OUT_DIR, os.path.splitext(f)[0] + ".png"))]
+    print(f"[upscale] {len(files)} na entrada | {len(todo)} a processar "
+          f"({len(files) - len(todo)} ja prontas na saida)")
+
+    ok = 0
+    for i, fn in enumerate(todo, start=1):
+        base = os.path.splitext(fn)[0]
+        try:
+            shutil.copyfile(os.path.join(IN_DIR, fn), STAGE)
+            out_path = run_one("%s/%s" % (TMP_SUB, base))
+            shutil.move(out_path, os.path.join(OUT_DIR, base + ".png"))
+            ok += 1
+            print(f"[{i}/{len(todo)}] {fn} ok")
+        except Exception as e:
+            print(f"[{i}/{len(todo)}] {fn} FALHOU: {e}")
+
+    tmp = os.path.join(COMFY, "output", TMP_SUB)
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"\n[fim] {ok} imagens nitidas em {OUT_DIR}")
+    print("[fim] baixe com: botao direito na pasta 'saida' -> Download as Archive")
+
+if __name__ == "__main__":
+    main()
+PYEOF_UPSCALE
+chmod +x /workspace/scripts/upscale.py
+
 cat > "$WF_DIR/6 - Personagens em Lote (leia-me).json" << 'WORKFLOW_EOF_CHARNOTE'
-{"id":"char-batch-note-0001","revision":0,"last_node_id":1,"last_link_id":0,"nodes":[{"id":1,"type":"MarkdownNote","pos":[0,0],"size":[620,900],"flags":{},"order":0,"mode":0,"inputs":[],"outputs":[],"title":"Personagens em Lote — como usar","properties":{},"widgets_values":["## Personagens em Lote (rosto + roupa fixos)\n\nEste recurso NAO roda por este workflow: ele roda por um comando no\nterminal do Jupyter. Este cartao e so o manual.\n\n**1) Cadastrar os personagens**\nJupyterLab -> pasta `/workspace/characters/` -> suba as referencias:\n`daniel_1.png`, `daniel_2.png`, `sabrina_1.png` ...\n(`nome_variante` = mesma pessoa com outra roupa; minusculas, sem acento)\n\nReferencia ideal: MEIO CORPO, rosto frontal/3-4, fundo neutro, 1 pessoa so.\nDica: gere a referencia no workflow \"2 - Gerar Imagem\" e crie as variantes\nde roupa no \"3 - Editar Rosto\" (\"change his coat to a gray hoodie, keep\neverything else identical\").\n\n**2) (Recomendado) characters.json na mesma pasta**\n```\n{\n  \"daniel\": {\n    \"gender\": \"man\",\n    \"descriptor\": \"middle-aged man with short gray hair\",\n    \"wardrobe\": { \"1\": \"black winter coat\", \"2\": \"gray hoodie\" }\n  }\n}\n```\n\n**3) O TXT (1 prompt por linha, em INGLES)**\n```\n[Daniel] walking down a deserted street at night, heavy rain\n[Daniel:2][Sabrina] arguing in the kitchen, tense atmosphere\na grand gala ball, hundreds of elegant guests dancing\n```\nREGRA DE OURO: na linha com tag, descreva ACAO/CENARIO/LUZ.\nNAO reapresente o personagem (\"[Daniel] a man walking...\" gera um\nsegundo homem parecido na cena).\n\n**4) Rodar (terminal do Jupyter)**\n```\npython /workspace/scripts/batch_characters.py /workspace/projeto.txt\n```\nFlags: `--resume` (retoma lote interrompido) | `--seed N` | `--ar 9:16` |\n`--variants N` | `--sheet-mode` | `--steps N` | `--cfg X`\n\n**5) Resultado**\n`ComfyUI/output/characters_batch/RUN_<data>/` ->\nimagens `0001_daniel.png`..., `batch_report.txt` e `contact_sheet.jpg`\n(mosaico para revisar tudo de uma olhada).\n\nRotas: sem tag -> Qwen-2512 normal | 1-3 tags -> Edit 2511 CRU\n(32 steps / CFG 3.0) | 4+ tags -> duas passadas com 2 variacoes."],"color":"#432","bgcolor":"#653"}],"links":[],"groups":[],"config":{},"extra":{},"version":0.4}
+{"id":"char-batch-note-0001","revision":0,"last_node_id":1,"last_link_id":0,"nodes":[{"id":1,"type":"MarkdownNote","pos":[0,0],"size":[620,900],"flags":{},"order":0,"mode":0,"inputs":[],"outputs":[],"title":"Personagens em Lote — como usar","properties":{},"widgets_values":["## Personagens em Lote (rosto + roupa fixos)\n\nEste recurso NAO roda por este workflow: ele roda por um comando no\nterminal do Jupyter. Este cartao e so o manual.\n\n**1) Cadastrar os personagens**\nJupyterLab -> pasta `/workspace/characters/` -> suba as referencias:\n`daniel (1).png`, `daniel (2).png`, `sabrina (1).png` ...\n(selecione tudo + F2 no Windows que a numeracao sai assim; numero = roupa;\nminusculas, sem acento)\n\nReferencia ideal: CORPO INTEIRO, rosto frontal/3-4, fundo neutro, 1 pessoa so.\nO enquadramento de cada CENA e definido no prompt da linha: escreva\n`full body shot` ou `medium close-up, bust framing` conforme quiser.\nDica: gere a referencia no workflow \"2 - Gerar Imagem\" e crie as variantes\nde roupa no \"3 - Editar Rosto\" (\"change his coat to a gray hoodie, keep\neverything else identical\").\n\n**2) (Recomendado) characters.json na mesma pasta**\n```\n{\n  \"daniel\": {\n    \"gender\": \"man\",\n    \"descriptor\": \"middle-aged man with short gray hair\",\n    \"wardrobe\": { \"1\": \"black winter coat\", \"2\": \"gray hoodie\" }\n  }\n}\n```\n\n**3) O TXT (1 prompt por linha, em INGLES)**\n```\n[Daniel] walking down a deserted street at night, heavy rain\n[Daniel:2][Sabrina] arguing in the kitchen, tense atmosphere\na grand gala ball, hundreds of elegant guests dancing\n```\nREGRA DE OURO: na linha com tag, descreva ACAO/CENARIO/LUZ.\nNAO reapresente o personagem (\"[Daniel] a man walking...\" gera um\nsegundo homem parecido na cena).\n\n**4) Rodar (terminal do Jupyter)**\n```\npython /workspace/scripts/batch_characters.py /workspace/projeto.txt\n```\nFlags: `--resume` (retoma lote interrompido) | `--seed N` | `--ar 9:16` |\n`--variants N` | `--sheet-mode` | `--steps N` | `--cfg X`\n\n**5) Resultado**\n`ComfyUI/output/characters_batch/RUN_<data>/` ->\nimagens `0001_daniel.png`..., `batch_report.txt` e `contact_sheet.jpg`\n(mosaico para revisar tudo de uma olhada).\n\nRotas: sem tag -> Qwen-2512 normal | 1-3 tags -> Edit 2511 CRU\n(32 steps / CFG 3.0) | 4+ tags -> duas passadas com 2 variacoes.\n\n**6) Nitidez 2x SELETIVA (apos revisar)**\nJogue so as imagens APROVADAS em `/workspace/upscale/entrada` e rode:\n```\npython /workspace/scripts/upscale.py\n```\nVersoes nitidas (3328x1856) saem em `/workspace/upscale/saida`."],"color":"#432","bgcolor":"#653"}],"links":[],"groups":[],"config":{},"extra":{},"version":0.4}
 WORKFLOW_EOF_CHARNOTE
 
 # ----------------------------------------------------------------------------
