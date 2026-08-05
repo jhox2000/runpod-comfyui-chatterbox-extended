@@ -35,6 +35,31 @@ export DEBIAN_FRONTEND=noninteractive
 # Ambiente Python da imagem da Vast: tudo roda dentro do venv /venv/main
 [ -f /venv/main/bin/activate ] && . /venv/main/bin/activate || true
 
+# ----------------------------------------------------------------------------
+# TESTE DE CONECTIVIDADE (roda ANTES de qualquer instalacao)
+# Alguns hosts da Vast (tipicamente na China) nao alcancam github.com nem
+# huggingface.co. Sem eles o boot morre no meio (clone do ComfyUI / download
+# dos ~88GB de modelos). Melhor falhar em 30 segundos do que no minuto 5.
+# ----------------------------------------------------------------------------
+echo "[boot] Testando acesso ao GitHub e ao HuggingFace..."
+if ! curl -sI --max-time 15 https://github.com >/dev/null; then
+    echo "[boot] ============================================================"
+    echo "[boot]  ERRO: este host NAO alcanca github.com."
+    echo "[boot]  Provavel host na China / rede com GitHub bloqueado."
+    echo "[boot]  >>> DESTRUA esta instancia e alugue outra em US/EU. <<<"
+    echo "[boot] ============================================================"
+    exit 1
+fi
+if ! curl -sI --max-time 15 https://huggingface.co >/dev/null; then
+    echo "[boot] ============================================================"
+    echo "[boot]  ERRO: este host NAO alcanca huggingface.co."
+    echo "[boot]  Sem ele os ~88GB de modelos nao baixam."
+    echo "[boot]  >>> DESTRUA esta instancia e alugue outra em US/EU. <<<"
+    echo "[boot] ============================================================"
+    exit 1
+fi
+echo "[boot] Conectividade OK (GitHub + HuggingFace acessiveis)."
+
 # HuggingFace: desligar hf_transfer (deprecado/ausente) e usar XET (rapido e moderno)
 unset HF_HUB_ENABLE_HF_TRANSFER
 export HF_XET_HIGH_PERFORMANCE=1
