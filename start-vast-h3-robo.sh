@@ -361,7 +361,13 @@ def aparar_inicio(caminho, segundos):
     os.replace(tmp, caminho)
 
 def extrair_cauda(clipe, destino, segundos):
-    cmd = ["ffmpeg", "-y", "-sseof", f"-{segundos}", "-i", clipe,
+    # corte EXATO: mesmo tamanho da apara (grade de frames), video e audio juntos
+    seg = _frames_ancora(segundos) / 24.0
+    r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
+                        "-of","csv=p=0",clipe], capture_output=True, text=True)
+    dur = float(r.stdout.strip())
+    ini = max(0.0, dur - seg)
+    cmd = ["ffmpeg", "-y", "-i", clipe, "-ss", f"{ini:.4f}",
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", destino]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.isfile(destino):
@@ -583,7 +589,7 @@ EOF_ROBO
 chmod +x /workspace/scripts/robo_h3.py
 
 REPO=https://raw.githubusercontent.com/jhox2000/runpod-comfyui-chatterbox-extended/refs/heads/main
-for wf in wf_abertura.json wf_continuacao.json; do
+for wf in wf_abertura.json wf_continuacao.json wf_abertura_turbo.json wf_continuacao_turbo.json; do
   if curl -fsSL "$REPO/$wf" -o "/workspace/projeto/$wf" 2>/dev/null && [ -s "/workspace/projeto/$wf" ]; then
     echo "[boot]   [ok] $wf baixado do seu GitHub"
   else
