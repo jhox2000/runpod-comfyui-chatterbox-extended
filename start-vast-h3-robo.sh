@@ -405,6 +405,8 @@ def main():
 
     blocos = parse_txt(a.prompts, a.dur)
 
+    caudas_dir = os.path.join(a.saida, "caudas")
+
     # filtro (refazer / apenas) — "35" refaz o bloco inteiro; "35:3" refaz do clipe 3 ate o fim
     filtro = None
     partir = {}
@@ -484,8 +486,10 @@ def main():
         for b in blocos:
             ini = partir.get(b["num"], 1)
             ini = min(max(1, ini), len(b["clipes"]))
-            if ini > 1 and not os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{ini-1}.mp4")):
-                print(f"[B{b['num']:03d}] aviso: clipe {ini-1} nao esta em {a.saida} — refazendo o bloco inteiro")
+            tem_clipe = os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{ini-1}.mp4"))
+            tem_cauda = os.path.isfile(os.path.join(caudas_dir, f"cauda_B{b['num']:03d}_{ini}.mp4"))
+            if ini > 1 and not tem_clipe and not tem_cauda:
+                print(f"[B{b['num']:03d}] aviso: nao achei B{b['num']:03d}_{ini-1}.mp4 nem caudas/cauda_B{b['num']:03d}_{ini}.mp4 — refazendo o bloco inteiro")
                 ini = 1
             for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*.mp4")):
                 m2 = re.search(r"_(\d+)\.mp4$", f2)
@@ -499,7 +503,8 @@ def main():
         for b in blocos:
             s = st(b["num"])
             if s["status"] == "pendente" and s["feitos"] > 0:
-                if os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{s['feitos']}.mp4")):
+                if os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{s['feitos']}.mp4")) or \
+                   os.path.isfile(os.path.join(caudas_dir, f"cauda_B{b['num']:03d}_{s['feitos']+1}.mp4")):
                     for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*.mp4")):
                         m2 = re.search(r"_(\d+)\.mp4$", f2)
                         if m2 and int(m2.group(1)) > s["feitos"]:
@@ -526,9 +531,16 @@ def main():
             shutil.copy2(img_src, os.path.join(comfy_in, img_nome))
             wf = patch(wf_ab, clipe["prompt"], clipe["dur"], prefixo, imagem=img_nome)
         else:
+            # semente = cauda numerada guardada em filme/caudas/ (cauda_B035_3 = semente do clipe 3)
+            os.makedirs(caudas_dir, exist_ok=True)
+            cauda_guardada = os.path.join(caudas_dir, f"cauda_{nome}.mp4")
             anterior = caminho_clipe(num, elo - 1)
+            if not os.path.isfile(cauda_guardada):
+                if not os.path.isfile(anterior):
+                    raise RuntimeError(f"sem semente: nao existe {anterior} nem {cauda_guardada}")
+                extrair_cauda(anterior, cauda_guardada, a.cauda)
             cauda_nome = f"robo_cauda_{nome}.mp4"
-            extrair_cauda(anterior, os.path.join(comfy_in, cauda_nome), a.cauda)
+            shutil.copy2(cauda_guardada, os.path.join(comfy_in, cauda_nome))
             wf = patch(wf_co, clipe["prompt"], clipe["dur"], prefixo, video=cauda_nome)
         log(f"[{nome}] gerando ({clipe['dur']:g}s)...")
         t0 = time.time()
@@ -542,6 +554,12 @@ def main():
             # a continuacao repete a cauda no comeco; apara pra emenda ficar exata
             aparar_inicio(destino, _frames_ancora(a.cauda) / 24.0)
         gerados.append(destino)
+        if elo < len(bloco["clipes"]):
+            # ja guarda a semente do proximo clipe (vai no tar; serve pra refazer em outra instancia)
+            os.makedirs(caudas_dir, exist_ok=True)
+            prox = os.path.join(caudas_dir, f"cauda_B{num:03d}_{elo+1}.mp4")
+            extrair_cauda(destino, prox, a.cauda)
+            gerados.append(prox)
         log(f"[{nome}] ok em {int(time.time()-t0)}s -> {destino}")
 
     def tentar(bloco, elo):
