@@ -397,7 +397,7 @@ def main():
     ap.add_argument("--tentativas", type=int, default=2, help="tentativas por clipe (1 = sem retry)")
     ap.add_argument("--ordem", choices=["rodadas", "filme"], default="rodadas",
                     help="rodadas = todos os elos 1, depois todos os 2... (menos troca de modelo)")
-    ap.add_argument("--refazer", default=None, help="txt com numeros de bloco, um por linha")
+    ap.add_argument("--refazer", default=None, help="txt: 35 = bloco inteiro | 35:3 = refaz do clipe 3 ate o fim")
     ap.add_argument("--apenas", default=None, help="lista de blocos, ex: 35,78")
     ap.add_argument("--validar", action="store_true")
     ap.add_argument("--sem-tar", action="store_true")
@@ -405,14 +405,27 @@ def main():
 
     blocos = parse_txt(a.prompts, a.dur)
 
-    # filtro (refazer / apenas)
+    # filtro (refazer / apenas) — "35" refaz o bloco inteiro; "35:3" refaz do clipe 3 ate o fim
     filtro = None
+    partir = {}
     if a.refazer:
+        filtro = set()
         with open(a.refazer, encoding="utf-8-sig") as f:
-            filtro = {int(l.strip().lstrip("B").lstrip("0") or "0")
-                      for l in f if l.strip() and not l.strip().startswith("#")}
+            for l in f:
+                l = l.strip()
+                if not l or l.startswith("#"):
+                    continue
+                if ":" in l:
+                    bn, en = l.split(":", 1)
+                    num = int(bn.strip().lstrip("B").lstrip("0") or "0")
+                    partir[num] = max(1, int(en.strip()))
+                else:
+                    num = int(l.lstrip("B").lstrip("0") or "0")
+                    partir[num] = 1
+                filtro.add(num)
     if a.apenas:
         filtro = {int(x) for x in a.apenas.replace(" ", "").split(",") if x}
+        partir = {n: 1 for n in filtro}
     if filtro is not None:
         faltando = filtro - {b["num"] for b in blocos}
         if faltando:
@@ -466,19 +479,35 @@ def main():
     def st(num):
         return estado["blocos"].setdefault(f"{num:03d}", {"status": "pendente", "feitos": 0})
 
-    # em modo refazer/apenas, forca os blocos filtrados a recomecarem do zero
+    # em modo refazer/apenas: refaz do clipe pedido ate o fim, aproveitando os clipes bons
     if filtro is not None:
         for b in blocos:
-            estado["blocos"][f"{b['num']:03d}"] = {"status": "pendente", "feitos": 0}
+            ini = partir.get(b["num"], 1)
+            ini = min(max(1, ini), len(b["clipes"]))
+            if ini > 1 and not os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{ini-1}.mp4")):
+                print(f"[B{b['num']:03d}] aviso: clipe {ini-1} nao esta em {a.saida} — refazendo o bloco inteiro")
+                ini = 1
+            for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*.mp4")):
+                m2 = re.search(r"_(\d+)\.mp4$", f2)
+                if m2 and int(m2.group(1)) >= ini:
+                    os.remove(f2)
+            estado["blocos"][f"{b['num']:03d}"] = {"status": "pendente", "feitos": ini - 1}
         salvar_estado()
 
-    # bloco parcialmente feito em rodada anterior recomeca do zero (bloco e atomico)
-    for b in blocos:
-        s = st(b["num"])
-        if s["status"] == "pendente" and s["feitos"] > 0:
-            s["feitos"] = 0
-            for f in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*")):
-                os.remove(f)
+# retomada: aproveita os clipes ja feitos se os arquivos existem; senao recomeca o bloco
+    if filtro is None:
+        for b in blocos:
+            s = st(b["num"])
+            if s["status"] == "pendente" and s["feitos"] > 0:
+                if os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{s['feitos']}.mp4")):
+                    for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*.mp4")):
+                        m2 = re.search(r"_(\d+)\.mp4$", f2)
+                        if m2 and int(m2.group(1)) > s["feitos"]:
+                            os.remove(f2)
+                else:
+                    s["feitos"] = 0
+                    for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*")):
+                        os.remove(f2)
     salvar_estado()
 
     gerados = []
@@ -564,7 +593,9 @@ def main():
             f.write("Falharam: " + ", ".join(ruins) + "\n")
     if ruins:
         with open(os.path.join(meta, "refazer_sugerido.txt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(str(int(n)) for n in sorted(ruins)) + "\n")
+            for n in sorted(ruins):
+                fe = estado["blocos"][n]["feitos"]
+                f.write((f"{int(n)}:{fe+1}" if fe > 0 else str(int(n))) + "\n")
     log(f"FIM: {len(oks)} blocos ok, {len(ruins)} com falha. Resumo em {resumo}")
 
     # limpeza das caudas temporarias
