@@ -197,7 +197,7 @@ def _clipe(texto, dur_padrao):
         texto = texto[m.end():]
     if not texto:
         raise SystemExit("ERRO: prompt vazio depois do marcador de duracao.")
-    return {"prompt": texto, "dur": dur}
+    return {"prompt": texto.replace(" || ", "\n\n").strip(), "dur": dur}
 
 def achar_imagem(pasta, num):
     for padrao in (f"{num:03d}", f"{num:02d}", f"{num}"):
