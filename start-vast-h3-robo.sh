@@ -11,7 +11,7 @@
 #   H3_TEXT_ENCODER=nvfp4 | int8                      (padrao: nvfp4 na 5090, int8 nas demais)
 #   H3_SKIP_R2V=1        pula o checkpoint REF2VA     (NAO use: a continuacao precisa dele)
 # =============================================================================
-mkdir -p /workspace/logs /workspace/scripts /workspace/projeto/imagens /workspace/filme
+mkdir -p /workspace/logs /workspace/scripts /workspace/projeto/imagens /workspace/filme /workspace/projeto/vozes
 exec >> /workspace/logs/boot-h3.log 2>&1
 set -e
 echo "[boot] ====== $(date) ======"
@@ -102,6 +102,12 @@ FORMATO DO TXT:
     + @8 prompt da extensao 2...
     [002] prompt de abertura do bloco 2...
   - [N]  abre bloco novo e usa a imagem N (001.png etc.) da pasta de imagens
+  - [N] vozes=sol,nico  -> abertura com VOZ UNICA por personagem (receita E1D):
+        usa o wf_abertura_ref.json; a ordem dos nomes = <Audio 1>, <Audio 2>
+        (= ordem em que falam no clipe). Os arquivos vem do vozes.json ao lado
+        do prompts_videos.txt: {"sol": "vozes/sol.wav", "nico": "vozes/nico.wav"}.
+        Bloco sem vozes= roda exatamente como sempre. Continuacoes nunca mudam
+        (a voz clonada atravessa a emenda pela cauda).
   - +    extensao do bloco aberto (continua do fim do clipe anterior)
   - @N   (opcional, logo depois do marcador) duracao em segundos daquele clipe
   - linhas vazias e linhas comecando com # sao ignoradas
@@ -180,7 +186,10 @@ def parse_txt(caminho, dur_padrao):
             elif linha.startswith("+"):
                 if atual is None:
                     raise SystemExit(f"ERRO linha {n}: linha '+' antes de qualquer bloco [N].")
-                atual["clipes"].append(_clipe(linha[1:].strip(), dur_padrao))
+                c = _clipe(linha[1:].strip(), dur_padrao)
+                if c["vozes"]:
+                    raise SystemExit(f"ERRO linha {n}: vozes= so vale na abertura [N]; continuacao (+) herda a voz pela cauda.")
+                atual["clipes"].append(c)
             else:
                 raise SystemExit(f"ERRO linha {n}: linha nao comeca com [N] nem com + :\n  {linha[:80]}")
     nums = [b["num"] for b in blocos]
@@ -189,24 +198,38 @@ def parse_txt(caminho, dur_padrao):
         raise SystemExit(f"ERRO: numero de bloco repetido no txt: {sorted(dup)}")
     return blocos
 
+RE_VOZES = re.compile(r"^vozes\s*=\s*([A-Za-z0-9_\-]+(?:\s*,\s*[A-Za-z0-9_\-]+)*)\s*", re.I)
+
 def _clipe(texto, dur_padrao):
     dur = dur_padrao
-    m = RE_DUR.match(texto)
-    if m:
-        dur = float(m.group(1))
-        texto = texto[m.end():]
+    vozes = []
+    # @N e vozes= podem vir em qualquer ordem, logo depois do marcador
+    for _ in range(2):
+        m = RE_DUR.match(texto)
+        if m:
+            dur = float(m.group(1))
+            texto = texto[m.end():].lstrip()
+            continue
+        m = RE_VOZES.match(texto)
+        if m:
+            vozes = [v.strip().lower() for v in m.group(1).split(",") if v.strip()]
+            texto = texto[m.end():].lstrip()
     if not texto:
-        raise SystemExit("ERRO: prompt vazio depois do marcador de duracao.")
-    return {"prompt": texto.replace(" || ", "\n\n").strip(), "dur": dur}
+        raise SystemExit("ERRO: prompt vazio depois do marcador de duracao/vozes.")
+    if len(vozes) > 3:
+        raise SystemExit(f"ERRO: vozes={','.join(vozes)} tem {len(vozes)} vozes (maximo 3 por clipe).")
+    if len(set(vozes)) != len(vozes):
+        raise SystemExit(f"ERRO: nome repetido em vozes={','.join(vozes)}.")
+    return {"prompt": texto.replace(" || ", "\n\n").strip(), "dur": dur, "vozes": vozes}
 
 def achar_imagem(pasta, num):
-    for padrao in (f"{num:03d}", f"{num:02d}", f"{num}"):
+    for padrao in (f"{num:04d}", f"{num:03d}", f"{num:02d}", f"{num}"):
         for ext in IMG_EXT:
             hits = sorted(glob.glob(os.path.join(pasta, padrao + "*" + ext)))
             for h in hits:
                 base = os.path.basename(h)
                 pref = base.split(".")[0]
-                if pref in (f"{num:03d}", f"{num:02d}", str(num)):
+                if pref in (f"{num:04d}", f"{num:03d}", f"{num:02d}", str(num)):
                     return h
     return None
 
@@ -295,6 +318,70 @@ def patch(wf_base, prompt, dur, prefixo, imagem=None, video=None):
         for chave in ("seed", "noise_seed"):
             if chave in no.get("inputs", {}) and isinstance(no["inputs"][chave], (int, float)):
                 no["inputs"][chave] = random.randint(0, 2**48)
+    return wf
+
+def _frames_grade(segundos, fps=24):
+    # numero de frames na grade 17k+5 do H3 (arredonda pra cima)
+    alvo = max(5, round(segundos * fps))
+    return alvo + (5 - (alvo % 17)) % 17
+
+def encoder_texto(comfy):
+    hits = sorted(glob.glob(os.path.join(comfy, "models", "text_encoders", "qwen3vl*")))
+    return os.path.basename(hits[0]) if hits else None
+
+def patch_ref(wf_base, prompt, dur, prefixo, imagem, audios, clip_name=None):
+    """Abertura com voz unica (wf_abertura_ref.json): imagem = <Picture 1>,
+    audios[i] = <Audio i+1>. Slots de voz nao usados sao removidos do grafo."""
+    wf = json.loads(json.dumps(wf_base))
+    nid_gen, gen = _por_titulo(wf, "ROBO_PROMPT")
+    if gen is None:
+        cands = _por_classe(wf, ["MiniMaxH3ReferenceToVideo"])
+        if len(cands) != 1:
+            raise SystemExit("ERRO: wf_abertura_ref sem no ROBO_PROMPT (MiniMaxH3ReferenceToVideo).")
+        nid_gen, gen = cands[0]
+    if not _set_input(gen, ["prompt", "text"], prompt):
+        raise SystemExit("ERRO: no ROBO_PROMPT do wf_abertura_ref sem campo prompt.")
+    if "length" in gen["inputs"] and not isinstance(gen["inputs"]["length"], list):
+        gen["inputs"]["length"] = _frames_grade(dur)
+    # imagem
+    nid, no = _por_titulo(wf, "ROBO_IMAGEM")
+    if no is None:
+        cands = _por_classe(wf, ["LoadImage"])
+        if len(cands) != 1:
+            raise SystemExit("ERRO: wf_abertura_ref sem no ROBO_IMAGEM.")
+        no = cands[0][1]
+    if not _set_input(no, ["image", "file", "filename"], imagem):
+        raise SystemExit("ERRO: no ROBO_IMAGEM do wf_abertura_ref sem campo image.")
+    # vozes: ROBO_VOZ_1..3
+    for i in range(1, 4):
+        nid, no = _por_titulo(wf, f"ROBO_VOZ_{i}")
+        if i <= len(audios):
+            if no is None:
+                raise SystemExit(f"ERRO: wf_abertura_ref sem no ROBO_VOZ_{i} (precisa de {len(audios)} vozes).")
+            if not _set_input(no, ["audio", "file", "filename"], audios[i - 1]):
+                raise SystemExit(f"ERRO: no ROBO_VOZ_{i} sem campo audio.")
+        elif no is not None:
+            # slot vazio: tira o no e a ligacao no gerador
+            del wf[nid]
+            for k in list(gen["inputs"].keys()):
+                v = gen["inputs"][k]
+                if isinstance(v, list) and str(v[0]) == str(nid):
+                    del gen["inputs"][k]
+    # text encoder do pod (o wf vem com placeholder)
+    if clip_name:
+        for nid, no in _por_classe(wf, ["CLIPLoader"]):
+            if "clip_name" in no["inputs"] and "TROCADO" in str(no["inputs"]["clip_name"]):
+                no["inputs"]["clip_name"] = clip_name
+    # prefixo + seeds
+    achou_save = False
+    for nid, no in wf.items():
+        if "filename_prefix" in no.get("inputs", {}):
+            no["inputs"]["filename_prefix"] = prefixo; achou_save = True
+        for chave in ("seed", "noise_seed"):
+            if chave in no.get("inputs", {}) and isinstance(no["inputs"][chave], (int, float)):
+                no["inputs"][chave] = random.randint(0, 2**48)
+    if not achou_save:
+        raise SystemExit("ERRO: wf_abertura_ref sem SaveVideo (filename_prefix).")
     return wf
 
 # ----------------------------------------------------------------------------- execucao no ComfyUI
@@ -389,6 +476,9 @@ def main():
     ap.add_argument("--imagens", default="/workspace/projeto/imagens")
     ap.add_argument("--wf-abertura", default="/workspace/projeto/wf_abertura_turbo.json")
     ap.add_argument("--wf-continuacao", default="/workspace/projeto/wf_continuacao_turbo.json")
+    ap.add_argument("--wf-abertura-ref", default="/workspace/projeto/wf_abertura_ref.json",
+                    help="workflow de abertura com voz de referencia (receita E1D)")
+    ap.add_argument("--vozes", default=None, help="vozes.json (padrao: ao lado do prompts_videos.txt)")
     ap.add_argument("--saida", default="/workspace/filme")
     ap.add_argument("--comfy", default="/workspace/ComfyUI")
     ap.add_argument("--dur", type=float, default=10.0, help="duracao padrao por clipe (s)")
@@ -434,16 +524,51 @@ def main():
             raise SystemExit(f"ERRO: blocos pedidos que nao existem no txt: {sorted(faltando)}")
         blocos = [b for b in blocos if b["num"] in filtro]
 
+    # vozes unicas por personagem (opcional)
+    projeto_dir = os.path.dirname(os.path.abspath(a.prompts))
+    vozes_json = a.vozes or os.path.join(projeto_dir, "vozes.json")
+    vozes_map = {}
+    if os.path.isfile(vozes_json):
+        try:
+            bruto = json.load(open(vozes_json, encoding="utf-8-sig"))
+            vozes_map = {str(k).strip().lower(): str(v).strip() for k, v in bruto.items()}
+        except Exception as e:
+            raise SystemExit(f"ERRO: vozes.json invalido: {e}")
+    def voz_arquivo(tag):
+        p = vozes_map.get(tag)
+        if not p:
+            return None
+        return p if os.path.isabs(p) else os.path.join(projeto_dir, p)
+    usa_vozes = any(b["clipes"][0]["vozes"] for b in blocos)
+
     # validacao
     total_clipes = sum(len(b["clipes"]) for b in blocos)
     total_seg = sum(c["dur"] for b in blocos for c in b["clipes"])
     problemas = []
+    if usa_vozes and not os.path.isfile(a.wf_abertura_ref):
+        problemas.append(f"ha blocos com vozes= mas nao existe {a.wf_abertura_ref} (o boot baixa do GitHub)")
+    if usa_vozes and not vozes_map:
+        problemas.append(f"ha blocos com vozes= mas nao existe {vozes_json}")
     for b in blocos:
         if len(b["clipes"]) > 4:
             problemas.append(f"bloco {b['num']:03d}: {len(b['clipes'])} elos (maximo combinado: 4)")
         if achar_imagem(a.imagens, b["num"]) is None:
             problemas.append(f"bloco {b['num']:03d}: imagem nao encontrada em {a.imagens}")
-    print(f"== {len(blocos)} blocos | {total_clipes} clipes | ~{total_seg/60:.1f} min de filme ==")
+        ab = b["clipes"][0]
+        for i, tag in enumerate(ab["vozes"], 1):
+            arq = voz_arquivo(tag)
+            if arq is None:
+                problemas.append(f"bloco {b['num']:03d}: voz '{tag}' nao esta no vozes.json")
+            elif not os.path.isfile(arq):
+                problemas.append(f"bloco {b['num']:03d}: arquivo da voz '{tag}' nao existe: {arq}")
+            if f"<Audio {i}>" not in ab["prompt"]:
+                problemas.append(f"bloco {b['num']:03d}: vozes= tem '{tag}' na posicao {i} mas o prompt nao cita <Audio {i}>")
+        if ab["vozes"] and "subject_definitions:" not in ab["prompt"]:
+            problemas.append(f"bloco {b['num']:03d}: abertura com vozes= precisa do formato de referencia (subject_definitions: ...)")
+        if not ab["vozes"] and "<Audio 1>" in ab["prompt"]:
+            problemas.append(f"bloco {b['num']:03d}: prompt cita <Audio 1> mas a linha [N] nao tem vozes=")
+    n_voz = sum(1 for b in blocos if b["clipes"][0]["vozes"])
+    print(f"== {len(blocos)} blocos | {total_clipes} clipes | ~{total_seg/60:.1f} min de filme | {n_voz} aberturas com voz unica ==")
     if problemas:
         print("PROBLEMAS:"); [print("  - " + p) for p in problemas]
         raise SystemExit("Corrija o txt/imagens antes de rodar.")
@@ -470,6 +595,8 @@ def main():
 
     wf_ab = json.load(open(a.wf_abertura, encoding="utf-8"))
     wf_co = json.load(open(a.wf_continuacao, encoding="utf-8"))
+    wf_ref = json.load(open(a.wf_abertura_ref, encoding="utf-8")) if usa_vozes else None
+    clip_name = encoder_texto(a.comfy)
 
     # checkpoint
     estado = {"blocos": {}}
@@ -529,7 +656,16 @@ def main():
             img_src = achar_imagem(a.imagens, num)
             img_nome = f"robo_img_{num:03d}" + os.path.splitext(img_src)[1]
             shutil.copy2(img_src, os.path.join(comfy_in, img_nome))
-            wf = patch(wf_ab, clipe["prompt"], clipe["dur"], prefixo, imagem=img_nome)
+            if clipe["vozes"]:
+                audios = []
+                for i, tag in enumerate(clipe["vozes"], 1):
+                    src = voz_arquivo(tag)
+                    nome_voz = f"robo_voz_{num:03d}_{i}_{tag}" + os.path.splitext(src)[1]
+                    shutil.copy2(src, os.path.join(comfy_in, nome_voz))
+                    audios.append(nome_voz)
+                wf = patch_ref(wf_ref, clipe["prompt"], clipe["dur"], prefixo, img_nome, audios, clip_name)
+            else:
+                wf = patch(wf_ab, clipe["prompt"], clipe["dur"], prefixo, imagem=img_nome)
         else:
             # semente = cauda numerada guardada em filme/caudas/ (cauda_B035_3 = semente do clipe 3)
             os.makedirs(caudas_dir, exist_ok=True)
@@ -542,7 +678,7 @@ def main():
             cauda_nome = f"robo_cauda_{nome}.mp4"
             shutil.copy2(cauda_guardada, os.path.join(comfy_in, cauda_nome))
             wf = patch(wf_co, clipe["prompt"], clipe["dur"], prefixo, video=cauda_nome)
-        log(f"[{nome}] gerando ({clipe['dur']:g}s)...")
+        log(f"[{nome}] gerando ({clipe['dur']:g}s{', voz unica: ' + ','.join(clipe['vozes']) if clipe['vozes'] else ''})...")
         t0 = time.time()
         outputs = rodar_job(wf, a.timeout_min * 60, log)
         saida = achar_saida(outputs, comfy_out, os.path.join("robo", nome))
@@ -617,7 +753,7 @@ def main():
     log(f"FIM: {len(oks)} blocos ok, {len(ruins)} com falha. Resumo em {resumo}")
 
     # limpeza das caudas temporarias
-    for f in glob.glob(os.path.join(comfy_in, "robo_cauda_*")) + glob.glob(os.path.join(comfy_in, "robo_img_*")):
+    for f in glob.glob(os.path.join(comfy_in, "robo_cauda_*")) + glob.glob(os.path.join(comfy_in, "robo_img_*")) + glob.glob(os.path.join(comfy_in, "robo_voz_*")):
         try: os.remove(f)
         except OSError: pass
 
@@ -638,7 +774,7 @@ EOF_ROBO
 chmod +x /workspace/scripts/robo_h3.py
 
 REPO=https://raw.githubusercontent.com/jhox2000/runpod-comfyui-chatterbox-extended/refs/heads/main
-for wf in wf_abertura.json wf_continuacao.json wf_abertura_turbo.json wf_continuacao_turbo.json; do
+for wf in wf_abertura.json wf_continuacao.json wf_abertura_turbo.json wf_continuacao_turbo.json wf_abertura_ref.json; do
   if curl -fsSL "$REPO/$wf" -o "/workspace/projeto/$wf" 2>/dev/null && [ -s "/workspace/projeto/$wf" ]; then
     echo "[boot]   [ok] $wf baixado do seu GitHub"
   else
@@ -651,6 +787,8 @@ cat > /workspace/LEIA-ME-ROBO.txt << 'EOF_LEIA'
 ========================= ROBO H3 — COLA RAPIDA =========================
 Antes de rodar, arraste para as pastas:
   /workspace/projeto/prompts_videos.txt   (formato [N] / +)
+  /workspace/projeto/vozes.json + vozes/  (SO se o filme usa voz unica: os .wav e o
+                                           mapa nome -> arquivo; tambem na instancia de refazer)
   /workspace/projeto/imagens/             (001.png, 002.png ...)
   /workspace/projeto/wf_abertura.json     (se o boot avisou que falta)
   /workspace/projeto/wf_continuacao.json  (se o boot avisou que falta)
