@@ -11,7 +11,7 @@
 #   H3_TEXT_ENCODER=nvfp4 | int8                      (padrao: nvfp4 na 5090, int8 nas demais)
 #   H3_SKIP_R2V=1        pula o checkpoint REF2VA     (NAO use: a continuacao precisa dele)
 # =============================================================================
-mkdir -p /workspace/logs /workspace/scripts /workspace/projeto/imagens /workspace/filme
+mkdir -p /workspace/logs /workspace/scripts /workspace/projeto/imagens /workspace/filme /workspace/projeto/vozes
 exec >> /workspace/logs/boot-h3.log 2>&1
 set -e
 echo "[boot] ====== $(date) ======"
@@ -102,6 +102,12 @@ FORMATO DO TXT:
     + @8 prompt da extensao 2...
     [002] prompt de abertura do bloco 2...
   - [N]  abre bloco novo e usa a imagem N (001.png etc.) da pasta de imagens
+  - [N] vozes=sol,nico  -> abertura com VOZ UNICA por personagem (receita E1D):
+        usa o wf_abertura_ref.json; a ordem dos nomes = <Audio 1>, <Audio 2>
+        (= ordem em que falam no clipe). Os arquivos vem do vozes.json ao lado
+        do prompts_videos.txt: {"sol": "vozes/sol.wav", "nico": "vozes/nico.wav"}.
+        Bloco sem vozes= roda exatamente como sempre. Continuacoes nunca mudam
+        (a voz clonada atravessa a emenda pela cauda).
   - +    extensao do bloco aberto (continua do fim do clipe anterior)
   - @N   (opcional, logo depois do marcador) duracao em segundos daquele clipe
   - linhas vazias e linhas comecando com # sao ignoradas
@@ -160,6 +166,7 @@ def api(caminho, dados=None, timeout=60):
 
 RE_BLOCO = re.compile(r"^\[(\d+)\]\s*(.*)$")
 RE_DUR = re.compile(r"^@(\d+(?:\.\d+)?)\s+")
+RE_VOZES = re.compile(r"^vozes\s*=\s*([\w\-]+(?:\s*,\s*[\w\-]+)*)\s+", re.IGNORECASE)
 
 def parse_txt(caminho, dur_padrao):
     blocos = []   # [{num:int, clipes:[{prompt, dur}]}]
@@ -171,9 +178,25 @@ def parse_txt(caminho, dur_padrao):
                 continue
             m = RE_BLOCO.match(linha)
             if m:
-                atual = {"num": int(m.group(1)), "clipes": []}
+                atual = {"num": int(m.group(1)), "clipes": [], "vozes": []}
                 blocos.append(atual)
                 resto = m.group(2).strip()
+                # token opcional vozes=nome1,nome2 (so na abertura; antes ou depois do @dur)
+                pref_dur = ""
+                md = RE_DUR.match(resto)
+                if md:
+                    pref_dur = md.group(0); resto = resto[md.end():]
+                mv = RE_VOZES.match(resto)
+                if mv:
+                    atual["vozes"] = [v.strip().lower() for v in mv.group(1).split(",") if v.strip()]
+                    resto = resto[mv.end():]
+                    if not pref_dur:
+                        md = RE_DUR.match(resto)
+                        if md:
+                            pref_dur = md.group(0); resto = resto[md.end():]
+                if len(atual["vozes"]) > 3:
+                    raise SystemExit(f"ERRO linha {n}: maximo 3 vozes por bloco (limite do modelo), veio {len(atual['vozes'])}.")
+                resto = (pref_dur + resto).strip()
                 if not resto:
                     raise SystemExit(f"ERRO linha {n}: bloco [{m.group(1)}] sem prompt de abertura na mesma linha.")
                 atual["clipes"].append(_clipe(resto, dur_padrao))
@@ -197,7 +220,23 @@ def _clipe(texto, dur_padrao):
         texto = texto[m.end():]
     if not texto:
         raise SystemExit("ERRO: prompt vazio depois do marcador de duracao.")
-    return {"prompt": texto, "dur": dur}
+    return {"prompt": texto.replace(" || ", "\n\n").strip(), "dur": dur}
+
+def _frames_video(segundos, fps=24):
+    """Frames validos do H3 (grade 17k+5), no ponto mais proximo da duracao pedida."""
+    alvo = max(5, round(segundos * fps))
+    n = 5
+    while n + 17 <= alvo:
+        n += 17
+    return n + 17 if (alvo - n) > (n + 17 - alvo) else n
+
+def preparar_voz(origem, destino):
+    """Converte a voz de referencia pra mono 32 kHz, maximo 10 s."""
+    r = subprocess.run(["ffmpeg", "-y", "-i", origem, "-t", "10", "-vn",
+                        "-ac", "1", "-ar", "32000", destino],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"ERRO ao converter a voz {origem}: {r.stderr[-200:]}")
 
 def achar_imagem(pasta, num):
     for padrao in (f"{num:03d}", f"{num:02d}", f"{num}"):
@@ -297,6 +336,60 @@ def patch(wf_base, prompt, dur, prefixo, imagem=None, video=None):
                 no["inputs"][chave] = random.randint(0, 2**48)
     return wf
 
+def patch_ref(wf_base, prompt, dur, prefixo, imagem, vozes_input):
+    """Prepara o workflow de abertura COM voz de referencia (receita E1D).
+    vozes_input = lista de nomes de arquivo ja dentro do input do ComfyUI,
+    na ordem <Audio 1>, <Audio 2>, <Audio 3> (= ordem de vocalizacao)."""
+    wf = json.loads(json.dumps(wf_base))
+    nid_gen, gen = _por_titulo(wf, "ROBO_PROMPT")
+    if gen is None:
+        raise SystemExit("ERRO: wf_abertura_ref.json sem no ROBO_PROMPT.")
+    gen["inputs"]["prompt"] = prompt
+    gen["inputs"]["length"] = _frames_video(dur)
+    nid, no = _por_titulo(wf, "ROBO_IMAGEM")
+    if no is None or not _set_input(no, ["image", "file", "filename"], imagem):
+        raise SystemExit("ERRO: wf_abertura_ref.json sem ROBO_IMAGEM utilizavel.")
+    for i in range(3):
+        nid_v, no_v = _por_titulo(wf, f"ROBO_VOZ_{i+1}")
+        if i < len(vozes_input):
+            if no_v is None or not _set_input(no_v, ["audio", "file", "filename"], vozes_input[i]):
+                raise SystemExit(f"ERRO: wf_abertura_ref.json sem ROBO_VOZ_{i+1}.")
+        else:
+            # slot de voz nao usado: tira o no e o fio dele no gerador
+            if nid_v is not None:
+                del wf[nid_v]
+            gen["inputs"].pop(f"ref_audios.ref_audio_{i}", None)
+    for nid2, no2 in wf.items():
+        if "filename_prefix" in no2.get("inputs", {}):
+            no2["inputs"]["filename_prefix"] = prefixo
+        for chave in ("seed", "noise_seed"):
+            if chave in no2.get("inputs", {}) and isinstance(no2["inputs"][chave], (int, float)):
+                no2["inputs"][chave] = random.randint(0, 2**48)
+    return wf
+
+def sincronizar_modelos(wf_ref, wf_prod):
+    """Copia pro workflow de referencia os MESMOS arquivos de modelo que a
+    producao usa (unet, clip, lora, vaes) — assim funciona em qualquer pod
+    (int8 ou nvfp4) sem editar nada."""
+    try:
+        for classe, campo in (("UNETLoader", "unet_name"), ("CLIPLoader", "clip_name"),
+                              ("LoraLoaderModelOnly", "lora_name")):
+            prod = _por_classe(wf_prod, [classe])
+            ref = _por_classe(wf_ref, [classe])
+            if prod and ref and campo in prod[0][1].get("inputs", {}):
+                ref[0][1]["inputs"][campo] = prod[0][1]["inputs"][campo]
+                if classe == "LoraLoaderModelOnly" and "strength_model" in prod[0][1]["inputs"]:
+                    ref[0][1]["inputs"]["strength_model"] = prod[0][1]["inputs"]["strength_model"]
+        vaes_prod = [no["inputs"]["vae_name"] for _, no in _por_classe(wf_prod, ["VAELoader"])
+                     if "vae_name" in no.get("inputs", {})]
+        for _, no in _por_classe(wf_ref, ["VAELoader"]):
+            atual = no["inputs"].get("vae_name", "")
+            for nome in vaes_prod:
+                if ("audio" in nome.lower()) == ("audio" in atual.lower()):
+                    no["inputs"]["vae_name"] = nome
+    except Exception as e:
+        print(f"aviso: nao consegui sincronizar modelos do wf de referencia ({e}); usando os nomes do proprio arquivo.")
+
 # ----------------------------------------------------------------------------- execucao no ComfyUI
 
 def rodar_job(wf, timeout_s, log):
@@ -340,8 +433,34 @@ def achar_saida(outputs, comfy_out, prefixo):
     hits = [h for h in hits if h.lower().endswith(VID_EXT)]
     return hits[-1] if hits else None
 
+def _frames_ancora(segundos, fps=24):
+    # o AddGuide arredonda a cauda pra baixo na grade 17k+5 (5, 22, 39...)
+    alvo = round(segundos * fps)
+    if alvo < 5:
+        return 1
+    n = 5
+    while n + 17 <= alvo:
+        n += 17
+    return n
+
+def aparar_inicio(caminho, segundos):
+    # remove do clipe de continuacao o trecho da cauda que ele repete no comeco
+    tmp = caminho + ".tmp.mp4"
+    cmd = ["ffmpeg", "-y", "-ss", f"{segundos:.4f}", "-i", caminho,
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", tmp]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.isfile(tmp):
+        raise RuntimeError("ffmpeg falhou ao aparar o inicio: " + r.stderr[-300:])
+    os.replace(tmp, caminho)
+
 def extrair_cauda(clipe, destino, segundos):
-    cmd = ["ffmpeg", "-y", "-sseof", f"-{segundos}", "-i", clipe,
+    # corte EXATO: mesmo tamanho da apara (grade de frames), video e audio juntos
+    seg = _frames_ancora(segundos) / 24.0
+    r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
+                        "-of","csv=p=0",clipe], capture_output=True, text=True)
+    dur = float(r.stdout.strip())
+    ini = max(0.0, dur - seg)
+    cmd = ["ffmpeg", "-y", "-i", clipe, "-ss", f"{ini:.4f}",
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", destino]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.isfile(destino):
@@ -361,8 +480,11 @@ def main():
     ap = argparse.ArgumentParser(description="Robo de blocos encadeados MiniMax H3")
     ap.add_argument("--prompts", default="/workspace/projeto/prompts_videos.txt")
     ap.add_argument("--imagens", default="/workspace/projeto/imagens")
-    ap.add_argument("--wf-abertura", default="/workspace/projeto/wf_abertura.json")
-    ap.add_argument("--wf-continuacao", default="/workspace/projeto/wf_continuacao.json")
+    ap.add_argument("--wf-abertura", default="/workspace/projeto/wf_abertura_turbo.json")
+    ap.add_argument("--wf-continuacao", default="/workspace/projeto/wf_continuacao_turbo.json")
+    ap.add_argument("--wf-abertura-ref", default="/workspace/projeto/wf_abertura_ref.json",
+                    help="workflow de abertura com voz de referencia (receita E1D)")
+    ap.add_argument("--vozes", default=None, help="vozes.json (padrao: ao lado do prompts_videos.txt)")
     ap.add_argument("--saida", default="/workspace/filme")
     ap.add_argument("--comfy", default="/workspace/ComfyUI")
     ap.add_argument("--dur", type=float, default=10.0, help="duracao padrao por clipe (s)")
@@ -371,7 +493,7 @@ def main():
     ap.add_argument("--tentativas", type=int, default=2, help="tentativas por clipe (1 = sem retry)")
     ap.add_argument("--ordem", choices=["rodadas", "filme"], default="rodadas",
                     help="rodadas = todos os elos 1, depois todos os 2... (menos troca de modelo)")
-    ap.add_argument("--refazer", default=None, help="txt com numeros de bloco, um por linha")
+    ap.add_argument("--refazer", default=None, help="txt: 35 = bloco inteiro | 35:3 = refaz do clipe 3 ate o fim")
     ap.add_argument("--apenas", default=None, help="lista de blocos, ex: 35,78")
     ap.add_argument("--validar", action="store_true")
     ap.add_argument("--sem-tar", action="store_true")
@@ -379,30 +501,85 @@ def main():
 
     blocos = parse_txt(a.prompts, a.dur)
 
-    # filtro (refazer / apenas)
+    caudas_dir = os.path.join(a.saida, "caudas")
+
+    # filtro (refazer / apenas) — "35" refaz o bloco inteiro; "35:3" refaz do clipe 3 ate o fim
     filtro = None
+    partir = {}
     if a.refazer:
+        filtro = set()
         with open(a.refazer, encoding="utf-8-sig") as f:
-            filtro = {int(l.strip().lstrip("B").lstrip("0") or "0")
-                      for l in f if l.strip() and not l.strip().startswith("#")}
+            for l in f:
+                l = l.strip()
+                if not l or l.startswith("#"):
+                    continue
+                if ":" in l:
+                    bn, en = l.split(":", 1)
+                    num = int(bn.strip().lstrip("B").lstrip("0") or "0")
+                    partir[num] = max(1, int(en.strip()))
+                else:
+                    num = int(l.lstrip("B").lstrip("0") or "0")
+                    partir[num] = 1
+                filtro.add(num)
     if a.apenas:
         filtro = {int(x) for x in a.apenas.replace(" ", "").split(",") if x}
+        partir = {n: 1 for n in filtro}
     if filtro is not None:
         faltando = filtro - {b["num"] for b in blocos}
         if faltando:
             raise SystemExit(f"ERRO: blocos pedidos que nao existem no txt: {sorted(faltando)}")
         blocos = [b for b in blocos if b["num"] in filtro]
 
+    # vozes unicas por personagem (opcional)
+    projeto_dir = os.path.dirname(os.path.abspath(a.prompts))
+    vozes_json = a.vozes or os.path.join(projeto_dir, "vozes.json")
+    vozes_map = {}
+    if os.path.isfile(vozes_json):
+        try:
+            bruto = json.load(open(vozes_json, encoding="utf-8-sig"))
+            vozes_map = {str(k).strip().lower(): str(v).strip() for k, v in bruto.items()}
+        except Exception as e:
+            raise SystemExit(f"ERRO: vozes.json invalido: {e}")
+
+    def voz_caminho(nome):
+        p = vozes_map.get(nome)
+        if not p:
+            return None
+        return p if os.path.isabs(p) else os.path.join(projeto_dir, p)
+
+    usa_vozes = any(b.get("vozes") for b in blocos)
+
     # validacao
     total_clipes = sum(len(b["clipes"]) for b in blocos)
     total_seg = sum(c["dur"] for b in blocos for c in b["clipes"])
     problemas = []
+    avisos = []
     for b in blocos:
         if len(b["clipes"]) > 4:
             problemas.append(f"bloco {b['num']:03d}: {len(b['clipes'])} elos (maximo combinado: 4)")
         if achar_imagem(a.imagens, b["num"]) is None:
             problemas.append(f"bloco {b['num']:03d}: imagem nao encontrada em {a.imagens}")
-    print(f"== {len(blocos)} blocos | {total_clipes} clipes | ~{total_seg/60:.1f} min de filme ==")
+        for nome in b.get("vozes", []):
+            if nome not in vozes_map:
+                problemas.append(f"bloco {b['num']:03d}: voz '{nome}' nao esta no vozes.json ({vozes_json})")
+            elif not os.path.isfile(voz_caminho(nome)):
+                problemas.append(f"bloco {b['num']:03d}: arquivo da voz '{nome}' nao existe: {voz_caminho(nome)}")
+        p0 = b["clipes"][0]["prompt"]
+        if b.get("vozes"):
+            for i in range(1, len(b["vozes"]) + 1):
+                if f"<Audio {i}>" not in p0:
+                    avisos.append(f"bloco {b['num']:03d}: tem {len(b['vozes'])} vozes mas o prompt de abertura nao cita <Audio {i}> — essa voz nao vai amarrar")
+            if "subject_definitions" not in p0:
+                avisos.append(f"bloco {b['num']:03d}: tem vozes= mas o prompt de abertura nao esta no formato de referencia (falta subject_definitions)")
+        elif "subject_definitions" in p0:
+            avisos.append(f"bloco {b['num']:03d}: prompt de abertura em formato de referencia mas SEM vozes= — vai rodar na abertura normal e o formato pode sair errado")
+    if usa_vozes and not os.path.isfile(a.wf_abertura_ref):
+        problemas.append(f"ha blocos com vozes= mas falta o workflow {a.wf_abertura_ref}")
+    n_voz = sum(1 for b in blocos if b.get("vozes"))
+    print(f"== {len(blocos)} blocos | {total_clipes} clipes | ~{total_seg/60:.1f} min de filme"
+          + (f" | {n_voz} aberturas com voz unica" if n_voz else "") + " ==")
+    if avisos:
+        print("AVISOS:"); [print("  - " + p) for p in avisos]
     if problemas:
         print("PROBLEMAS:"); [print("  - " + p) for p in problemas]
         raise SystemExit("Corrija o txt/imagens antes de rodar.")
@@ -429,6 +606,18 @@ def main():
 
     wf_ab = json.load(open(a.wf_abertura, encoding="utf-8"))
     wf_co = json.load(open(a.wf_continuacao, encoding="utf-8"))
+    wf_ref = None
+    if usa_vozes:
+        wf_ref = json.load(open(a.wf_abertura_ref, encoding="utf-8"))
+        sincronizar_modelos(wf_ref, wf_ab)
+        # converte cada voz usada (mono 32 kHz, max 10 s) e poe no input do ComfyUI
+        vozes_input = {}
+        for nome in sorted({v for b in blocos for v in b.get("vozes", [])}):
+            destino = os.path.join(comfy_in, f"robo_voz_{nome}.wav")
+            preparar_voz(voz_caminho(nome), destino)
+            vozes_input[nome] = f"robo_voz_{nome}.wav"
+        log_vozes = ", ".join(sorted(vozes_input))
+        print(f"vozes preparadas: {log_vozes}")
 
     # checkpoint
     estado = {"blocos": {}}
@@ -440,19 +629,38 @@ def main():
     def st(num):
         return estado["blocos"].setdefault(f"{num:03d}", {"status": "pendente", "feitos": 0})
 
-    # em modo refazer/apenas, forca os blocos filtrados a recomecarem do zero
+    # em modo refazer/apenas: refaz do clipe pedido ate o fim, aproveitando os clipes bons
     if filtro is not None:
         for b in blocos:
-            estado["blocos"][f"{b['num']:03d}"] = {"status": "pendente", "feitos": 0}
+            ini = partir.get(b["num"], 1)
+            ini = min(max(1, ini), len(b["clipes"]))
+            tem_clipe = os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{ini-1}.mp4"))
+            tem_cauda = os.path.isfile(os.path.join(caudas_dir, f"cauda_B{b['num']:03d}_{ini}.mp4"))
+            if ini > 1 and not tem_clipe and not tem_cauda:
+                print(f"[B{b['num']:03d}] aviso: nao achei B{b['num']:03d}_{ini-1}.mp4 nem caudas/cauda_B{b['num']:03d}_{ini}.mp4 — refazendo o bloco inteiro")
+                ini = 1
+            for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*.mp4")):
+                m2 = re.search(r"_(\d+)\.mp4$", f2)
+                if m2 and int(m2.group(1)) >= ini:
+                    os.remove(f2)
+            estado["blocos"][f"{b['num']:03d}"] = {"status": "pendente", "feitos": ini - 1}
         salvar_estado()
 
-    # bloco parcialmente feito em rodada anterior recomeca do zero (bloco e atomico)
-    for b in blocos:
-        s = st(b["num"])
-        if s["status"] == "pendente" and s["feitos"] > 0:
-            s["feitos"] = 0
-            for f in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*")):
-                os.remove(f)
+# retomada: aproveita os clipes ja feitos se os arquivos existem; senao recomeca o bloco
+    if filtro is None:
+        for b in blocos:
+            s = st(b["num"])
+            if s["status"] == "pendente" and s["feitos"] > 0:
+                if os.path.isfile(os.path.join(a.saida, f"B{b['num']:03d}_{s['feitos']}.mp4")) or \
+                   os.path.isfile(os.path.join(caudas_dir, f"cauda_B{b['num']:03d}_{s['feitos']+1}.mp4")):
+                    for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*.mp4")):
+                        m2 = re.search(r"_(\d+)\.mp4$", f2)
+                        if m2 and int(m2.group(1)) > s["feitos"]:
+                            os.remove(f2)
+                else:
+                    s["feitos"] = 0
+                    for f2 in glob.glob(os.path.join(a.saida, f"B{b['num']:03d}_*")):
+                        os.remove(f2)
     salvar_estado()
 
     gerados = []
@@ -469,11 +677,22 @@ def main():
             img_src = achar_imagem(a.imagens, num)
             img_nome = f"robo_img_{num:03d}" + os.path.splitext(img_src)[1]
             shutil.copy2(img_src, os.path.join(comfy_in, img_nome))
-            wf = patch(wf_ab, clipe["prompt"], clipe["dur"], prefixo, imagem=img_nome)
+            if bloco.get("vozes"):
+                wf = patch_ref(wf_ref, clipe["prompt"], clipe["dur"], prefixo,
+                               img_nome, [vozes_input[v] for v in bloco["vozes"]])
+            else:
+                wf = patch(wf_ab, clipe["prompt"], clipe["dur"], prefixo, imagem=img_nome)
         else:
+            # semente = cauda numerada guardada em filme/caudas/ (cauda_B035_3 = semente do clipe 3)
+            os.makedirs(caudas_dir, exist_ok=True)
+            cauda_guardada = os.path.join(caudas_dir, f"cauda_{nome}.mp4")
             anterior = caminho_clipe(num, elo - 1)
+            if not os.path.isfile(cauda_guardada):
+                if not os.path.isfile(anterior):
+                    raise RuntimeError(f"sem semente: nao existe {anterior} nem {cauda_guardada}")
+                extrair_cauda(anterior, cauda_guardada, a.cauda)
             cauda_nome = f"robo_cauda_{nome}.mp4"
-            extrair_cauda(anterior, os.path.join(comfy_in, cauda_nome), a.cauda)
+            shutil.copy2(cauda_guardada, os.path.join(comfy_in, cauda_nome))
             wf = patch(wf_co, clipe["prompt"], clipe["dur"], prefixo, video=cauda_nome)
         log(f"[{nome}] gerando ({clipe['dur']:g}s)...")
         t0 = time.time()
@@ -483,7 +702,16 @@ def main():
             raise RuntimeError("job terminou mas nenhum video foi encontrado na saida")
         destino = caminho_clipe(num, elo)
         shutil.copy2(saida, destino)
+        if elo > 1:
+            # a continuacao repete a cauda no comeco; apara pra emenda ficar exata
+            aparar_inicio(destino, _frames_ancora(a.cauda) / 24.0)
         gerados.append(destino)
+        if elo < len(bloco["clipes"]):
+            # ja guarda a semente do proximo clipe (vai no tar; serve pra refazer em outra instancia)
+            os.makedirs(caudas_dir, exist_ok=True)
+            prox = os.path.join(caudas_dir, f"cauda_B{num:03d}_{elo+1}.mp4")
+            extrair_cauda(destino, prox, a.cauda)
+            gerados.append(prox)
         log(f"[{nome}] ok em {int(time.time()-t0)}s -> {destino}")
 
     def tentar(bloco, elo):
@@ -535,11 +763,13 @@ def main():
             f.write("Falharam: " + ", ".join(ruins) + "\n")
     if ruins:
         with open(os.path.join(meta, "refazer_sugerido.txt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(str(int(n)) for n in sorted(ruins)) + "\n")
+            for n in sorted(ruins):
+                fe = estado["blocos"][n]["feitos"]
+                f.write((f"{int(n)}:{fe+1}" if fe > 0 else str(int(n))) + "\n")
     log(f"FIM: {len(oks)} blocos ok, {len(ruins)} com falha. Resumo em {resumo}")
 
     # limpeza das caudas temporarias
-    for f in glob.glob(os.path.join(comfy_in, "robo_cauda_*")) + glob.glob(os.path.join(comfy_in, "robo_img_*")):
+    for f in glob.glob(os.path.join(comfy_in, "robo_cauda_*")) + glob.glob(os.path.join(comfy_in, "robo_img_*")) + glob.glob(os.path.join(comfy_in, "robo_voz_*")):
         try: os.remove(f)
         except OSError: pass
 
@@ -560,7 +790,7 @@ EOF_ROBO
 chmod +x /workspace/scripts/robo_h3.py
 
 REPO=https://raw.githubusercontent.com/jhox2000/runpod-comfyui-chatterbox-extended/refs/heads/main
-for wf in wf_abertura.json wf_continuacao.json; do
+for wf in wf_abertura.json wf_continuacao.json wf_abertura_turbo.json wf_continuacao_turbo.json wf_abertura_ref.json; do
   if curl -fsSL "$REPO/$wf" -o "/workspace/projeto/$wf" 2>/dev/null && [ -s "/workspace/projeto/$wf" ]; then
     echo "[boot]   [ok] $wf baixado do seu GitHub"
   else
@@ -573,6 +803,9 @@ cat > /workspace/LEIA-ME-ROBO.txt << 'EOF_LEIA'
 ========================= ROBO H3 — COLA RAPIDA =========================
 Antes de rodar, arraste para as pastas:
   /workspace/projeto/prompts_videos.txt   (formato [N] / +)
+  /workspace/projeto/vozes.json + vozes/  (SO se o filme usa voz unica:
+                                           os .wav e o mapa nome -> arquivo;
+                                           necessarios tambem em instancia de refazer)
   /workspace/projeto/imagens/             (001.png, 002.png ...)
   /workspace/projeto/wf_abertura.json     (se o boot avisou que falta)
   /workspace/projeto/wf_continuacao.json  (se o boot avisou que falta)
