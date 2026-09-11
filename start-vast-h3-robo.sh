@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # start-vast-h3-robo.sh — boot 1-click na Vast.ai
-# ComfyUI + MiniMax H3 + ROBO de blocos encadeados, tudo pronto ao ligar.
+# ComfyUI + MiniMax H3 + ROBO de blocos encadeados + VIGIA (relanca o robo, reinicia o
+# ComfyUI, backup de hora em hora no Google Drive via rclone), tudo pronto ao ligar.
 #
 # On-start do template Vast (uma linha):
 # bash -c "mkdir -p /workspace && curl -fsSL https://raw.githubusercontent.com/jhox2000/runpod-comfyui-chatterbox-extended/refs/heads/main/start-vast-h3-robo.sh -o /workspace/boot.sh && bash /workspace/boot.sh"
@@ -16,13 +17,13 @@ exec >> /workspace/logs/boot-h3.log 2>&1
 set -e
 echo "[boot] ====== $(date) ======"
 
-echo "[boot] (1/8) Conectividade..."
+echo "[boot] (1/9) Conectividade..."
 curl -fsS -o /dev/null https://github.com || { echo "[boot] ERRO: sem acesso ao GitHub"; exit 1; }
 curl -fsS -o /dev/null https://huggingface.co || { echo "[boot] ERRO: sem acesso ao HuggingFace"; exit 1; }
 [ -f /venv/main/bin/activate ] && . /venv/main/bin/activate || true
 unset HF_HUB_ENABLE_HF_TRANSFER; export HF_XET_HIGH_PERFORMANCE=1
 
-echo "[boot] (2/8) GPU e dependencias base..."
+echo "[boot] (2/9) GPU e dependencias base..."
 GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo desconhecida)
 echo "[boot]   GPU: $GPU"
 case "$GPU" in *5090*|*B200*|*B100*|*RTX\ PRO*) BLACKWELL=1;; *) BLACKWELL=0;; esac
@@ -31,8 +32,9 @@ if [ -z "$TE" ]; then [ "$BLACKWELL" = "1" ] && TE=nvfp4 || TE=int8; fi
 [ "$BLACKWELL" = "0" ] && echo "[boot]   AVISO: GPU nao e Blackwell -> text encoder $TE"
 python3 -c "import torch" 2>/dev/null || pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 command -v ffmpeg >/dev/null || (apt-get update -qq && apt-get install -y -qq ffmpeg) || echo "[boot] AVISO: ffmpeg nao instalou (o robo precisa dele)"
+command -v rclone >/dev/null || (curl -fsSL https://rclone.org/install.sh | bash >/dev/null 2>&1 </dev/null) || echo "[boot] AVISO: rclone nao instalou (backup no Drive desligado)"
 
-echo "[boot] (3/8) ComfyUI (o H3 recebe correcoes semanais, sempre atualiza)..."
+echo "[boot] (3/9) ComfyUI (o H3 recebe correcoes semanais, sempre atualiza)..."
 cd /workspace
 [ -d ComfyUI ] || git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git
 cd /workspace/ComfyUI
@@ -41,7 +43,7 @@ pip install -q -r requirements.txt
 pip install -q -U huggingface_hub hf_xet
 grep -oE '__version__ = "[^"]+"' comfyui_version.py || true
 
-echo "[boot] (4/8) Modelos do H3 (~68GB, pula o que ja existe)..."
+echo "[boot] (4/9) Modelos do H3 (~68GB, pula o que ja existe)..."
 M=/workspace/ComfyUI/models
 mkdir -p "$M"/{diffusion_models,text_encoders,vae,loras,embeddings}
 hf_get() {
@@ -70,13 +72,13 @@ hf_get $R loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors "$M/l
 hf_get $R embeddings/minimaxh3_art_is_explosion.safetensors "$M/embeddings"
 rm -rf /workspace/_dl_h3
 
-echo "[boot] (5/8) Conferindo tamanhos..."
+echo "[boot] (5/9) Conferindo tamanhos..."
 chk() { local g=$(du -BG "$1" | cut -f1 | tr -d G); [ "$g" -ge "$2" ] && echo "[boot]   [ok] $(basename $1) ${g}GB" || { echo "[boot] ERRO: $1 truncado (${g}GB)"; exit 1; }; }
 chk "$M/diffusion_models/minimax_h3_fl2va_${PREC}.safetensors" 19
 [ "${H3_SKIP_R2V:-0}" != "1" ] && chk "$M/diffusion_models/minimax_h3_ref2va_${PREC}.safetensors" 19
 chk "$M/vae/minimax_h3_video_vae_fp16.safetensors" 4
 
-echo "[boot] (6/8) Workflows oficiais..."
+echo "[boot] (6/9) Workflows oficiais..."
 W=/workspace/ComfyUI/user/default/workflows
 mkdir -p "$W" /workspace/ComfyUI/output/robo
 T=https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates
@@ -84,7 +86,7 @@ curl -fsSL $T/video_minimax_h3_i2v.json | sed 's#"video/MiniMax_H3"#"robo/H3"#g'
 curl -fsSL $T/video_minimax_h3_r2v.json | sed 's#"video/MiniMax_H3"#"robo/H3"#g' > "$W/2 - H3 Referencia para Video (R2V).json" || true
 curl -fsSL $T/video_minimax_h3_t2v.json | sed 's#"video/MiniMax_H3"#"robo/H3"#g' > "$W/3 - H3 Texto para Video (T2V).json" || true
 
-echo "[boot] (7/8) Instalando o ROBO e buscando os workflows do robo no seu repo..."
+echo "[boot] (7/9) Instalando o ROBO e buscando os workflows do robo no seu repo..."
 cat > /workspace/scripts/robo_h3.py << 'EOF_ROBO'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -792,6 +794,9 @@ Antes de rodar, arraste para as pastas:
   /workspace/projeto/imagens/             (001.png, 002.png ...)
   /workspace/projeto/wf_abertura.json     (se o boot avisou que falta)
   /workspace/projeto/wf_continuacao.json  (se o boot avisou que falta)
+  /workspace/projeto/rclone.conf          (token do Google Drive; sem ele o backup fica desligado)
+  /workspace/projeto/vast_api_key.txt     (OPCIONAL: chave de API da Vast; com ele o vigia PARA a
+                                           instancia sozinho quando o filme termina)
 
 Conferir tudo (nao gera nada):
   cd /workspace && python3 scripts/robo_h3.py --validar
@@ -808,12 +813,203 @@ Rodada de correcao (depois da revisao):
 
 No final: baixe o /workspace/filme_DATA.tar (clipes + resumo + falhas).
 Clipes ficam em /workspace/filme/ como B001_1.mp4, B001_2.mp4 ...
+
+VIGIA (ja sobe sozinho no boot; log em /workspace/logs/vigia.log):
+  REGRA: a PRIMEIRA largada do robo e sua (comando acima). Toda RETOMADA e do vigia.
+  - a cada 5 min: se o robo caiu e a rodada nao chegou no FIM, relanca (retoma de onde parou)
+  - se o ComfyUI parou de responder (com ou sem robo vivo), espera 5 min, reinicia ele e relanca o robo
+  - se o robo ficar 60 min sem progresso, mata e reinicia tudo
+  - backup no Drive: na hora em que o rclone.conf aparece e depois a cada 60 min
+      /workspace/filme   -> gdrive:H3/filme    (clipes, caudas, estado do robo)
+      /workspace/projeto -> gdrive:H3/projeto  (prompts, imagens, vozes; chaves NAO vao)
+  - no FIM de uma rodada completa: backup final e, se existir vast_api_key.txt, PARA a instancia
+    (rodada parcial - teste --apenas ou --refazer - nao para)
+  POD NOVO DEPOIS DE PERDER A INSTANCIA: suba SO o rclone.conf em /workspace/projeto/ e espere.
+    Em ate 5 min o vigia restaura tudo do Drive e relanca o robo sozinho, de onde parou.
+  ATENCAO: ao comecar um FILME NOVO, renomeie antes as pastas H3/filme e H3/projeto no Drive
+  (ex: H3/filme_nadia, H3/projeto_nadia), senao o vigia restaura o filme antigo no pod novo.
+  NAO rode o boot.sh na mao com o robo trabalhando (ele reinicia o ComfyUI e derruba o clipe).
+  Ver o que o vigia fez:  cat /workspace/logs/vigia.log
+  Parar o vigia:          pkill -f scripts/vigia.sh
 =========================================================================
 EOF_LEIA
 
-echo "[boot] (8/8) Subindo o ComfyUI..."
+cat > /workspace/scripts/vigia.sh << 'EOF_VIGIA'
+#!/bin/bash
+# vigia.sh (v3) - vigia do robo H3. Fica ligado desde o boot e, a cada 5 min:
+#   - se o robo caiu e a rodada nao terminou, relanca (retoma de onde parou)
+#   - se o ComfyUI parou de responder (com ou sem robo vivo), reinicia ele e relanca o robo
+#   - se o robo ficar 60 min sem progresso, mata e reinicia tudo
+#   - restaura projeto e clipes do Drive quando o disco esta vazio (pod novo)
+#   - backup de hora em hora no Drive (e na hora, assim que o rclone.conf aparece)
+#   - no FIM do filme: ultimo backup e, se existir vast_api_key.txt, para a instancia
+# Regra: a PRIMEIRA largada do robo e sua (cd /workspace && nohup python3 scripts/robo_h3.py ...).
+# O vigia so relanca sozinho quando ja existe um robo.log, ou seja, uma rodada ja comecou.
+LOG=/workspace/logs/vigia.log
+ROBO_OUT=/workspace/logs/robo.out
+ROBO_LOG=/workspace/filme/_robo/robo.log
+PROJ=/workspace/projeto/prompts_videos.txt
+CONF=/workspace/projeto/rclone.conf
+VAST_KEY=/workspace/projeto/vast_api_key.txt
+REMOTO="gdrive:H3/filme"          # clipes, caudas e estado do robo
+REMOTO_PROJ="gdrive:H3/projeto"   # prompts, imagens, vozes (rclone.conf e vast_api_key.txt ficam de fora)
+CHECA=300        # checa a cada 5 min
+BACKUP=3600      # backup a cada 60 min
+TRAVADO=3600     # 60 min sem progresso = travado
+ESPERA_COMFY=300 # espera ate 5 min o ComfyUI responder antes de reinicia-lo
+MAX_RELANCA=3    # relancadas seguidas sem progresso antes de desistir
+
+log(){ echo "[$(date '+%d/%m %H:%M')] $*" >> "$LOG"; }
+robo_vivo(){ pgrep -f "python3 scripts/robo_h3.py" >/dev/null; }
+comfy_ok(){ [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8188/)" = "200" ]; }
+terminou(){ [ -f "$ROBO_LOG" ] && tail -n 3 "$ROBO_LOG" | grep -q "FIM:"; }
+n_clipes(){ ls /workspace/filme/*.mp4 2>/dev/null | wc -l; }
+idade_log(){ if [ -f "$ROBO_LOG" ]; then echo $(( $(date +%s) - $(stat -c %Y "$ROBO_LOG") )); else echo 0; fi; }
+tem_drive(){ [ -f "$CONF" ] && command -v rclone >/dev/null; }
+rc(){ rclone --config "$CONF" "$@"; }
+
+espera_comfy(){
+  local t=0
+  while [ $t -lt $ESPERA_COMFY ]; do comfy_ok && return 0; sleep 10; t=$((t+10)); done
+  return 1
+}
+sobe_comfy(){
+  log "ComfyUI nao responde - reiniciando"
+  pkill -f "main.py --listen"; sleep 5
+  cd /workspace/ComfyUI && nohup python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header > /workspace/logs/comfy.out 2>&1 &
+  if espera_comfy; then log "ComfyUI de volta"; return 0; fi
+  log "ERRO: ComfyUI nao voltou em 5 min"; return 1
+}
+garante_comfy(){ comfy_ok && return 0; espera_comfy && return 0; sobe_comfy; }
+mata_robo(){ pkill -f "python3 scripts/robo_h3.py"; sleep 3; }
+lanca_robo(){
+  cd /workspace && nohup python3 scripts/robo_h3.py >> "$ROBO_OUT" 2>&1 &
+  relancadas=$((relancadas+1)); log "robo relancado (tentativa $relancadas/$MAX_RELANCA) - retoma de onde parou"
+}
+backup(){
+  tem_drive || { log "backup pulado: falta $CONF ou o rclone"; return 1; }
+  local ok=0
+  if rc copy /workspace/filme "$REMOTO" -q 2>>"$LOG"; then
+    log "backup ok: $(rc lsf "$REMOTO" 2>/dev/null | grep -c '\.mp4$') clipes no Drive"
+  else
+    log "ERRO no backup dos clipes (ver linhas acima)"; ok=1
+  fi
+  if [ -f "$PROJ" ]; then
+    if rc copy /workspace/projeto "$REMOTO_PROJ" --exclude rclone.conf --exclude vast_api_key.txt -q 2>>"$LOG"; then
+      log "backup do projeto ok (prompts, imagens, vozes)"
+    else
+      log "ERRO no backup do projeto"; ok=1
+    fi
+  fi
+  return $ok
+}
+restaura(){
+  # so faz sentido com Drive; roda a cada passada ate conseguir (o rclone.conf pode chegar depois do boot)
+  tem_drive || return 1
+  if [ ! -f "$PROJ" ]; then
+    if rc lsf "$REMOTO_PROJ" 2>/dev/null | grep -q prompts_videos.txt; then
+      log "restauracao: projeto ausente no disco - baixando do Drive (prompts, imagens, vozes)"
+      rc copy "$REMOTO_PROJ" /workspace/projeto -q 2>>"$LOG" \
+        && log "restauracao do projeto ok" || { log "ERRO na restauracao do projeto"; return 1; }
+    fi
+  fi
+  if [ "$(n_clipes)" -eq 0 ]; then
+    local r=$(rc lsf "$REMOTO" 2>/dev/null | grep -c '\.mp4$')
+    if [ "$r" -gt 0 ]; then
+      log "restauracao: disco vazio e Drive com $r clipes - baixando (clipes, caudas, estado do robo)"
+      rc copy "$REMOTO" /workspace/filme -q 2>>"$LOG" \
+        && log "restauracao ok: $(n_clipes) clipes no disco - o robo vai retomar de onde parou" \
+        || { log "ERRO na restauracao dos clipes"; return 1; }
+    fi
+  fi
+  return 0
+}
+rodada_completa(){
+  # a rodada que acabou cobre todos os blocos do txt? (teste --apenas ou --refazer parcial = nao)
+  local fim=$(grep "FIM:" "$ROBO_LOG" | tail -n 1)
+  local oks=$(echo "$fim" | sed -n 's/.*FIM: \([0-9]\+\) blocos ok, \([0-9]\+\) com falha.*/\1/p')
+  local fal=$(echo "$fim" | sed -n 's/.*FIM: \([0-9]\+\) blocos ok, \([0-9]\+\) com falha.*/\2/p')
+  local tot=$(grep -cE '^\[[0-9]+\]' "$PROJ" 2>/dev/null)
+  [ -n "$oks" ] && [ -n "$fal" ] && [ -n "$tot" ] && [ $((oks+fal)) -ge "$tot" ]
+}
+para_instancia(){
+  [ -f "$VAST_KEY" ] || { log "filme terminou; sem $VAST_KEY, a instancia fica ligada (pare pelo painel)"; return; }
+  local key=$(tr -d ' \r\n' < "$VAST_KEY")
+  local id=$(hostname | sed -n 's/^C\.\([0-9]\+\)$/\1/p'); [ -z "$id" ] && id="$CONTAINER_ID"
+  [ -z "$id" ] && { log "ERRO: nao descobri o ID da instancia; pare pelo painel"; return; }
+  log "filme terminou e backup final ok - pedindo a Vast pra PARAR a instancia $id"
+  local resp=$(curl -s -m 30 -X PUT "https://console.vast.ai/api/v0/instances/$id/" \
+    -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d '{"state":"stopped"}')
+  log "resposta da Vast: ${resp:0:200}"
+}
+
+relancadas=0; ultimo_backup=0; restaurado=0; tinha_conf=0; fim_tratado=0
+log "vigia iniciado - $(n_clipes) clipes no disco"
+ultimo_n=$(n_clipes)
+# um FIM que ja existia quando o vigia subiu nao e novidade: nao para a instancia por causa dele
+terminou && fim_tratado=1
+while true; do
+  # restauracao (pod novo): tenta a cada passada ate conseguir
+  if [ "$restaurado" -eq 0 ] && restaura; then restaurado=1; terminou && fim_tratado=1; fi
+
+  n=$(n_clipes)
+  if [ "$n" -gt "$ultimo_n" ]; then relancadas=0; ultimo_n=$n; fi
+  uso=$(df /workspace | awk 'NR==2{print $5+0}'); [ "$uso" -ge 90 ] && log "AVISO: disco em ${uso}%"
+
+  if [ -f "$PROJ" ] && [ -f "$ROBO_LOG" ] && ! terminou; then
+    if robo_vivo; then
+      if ! comfy_ok; then
+        log "ComfyUI parou de responder com o robo vivo"
+        if ! espera_comfy; then
+          mata_robo; sobe_comfy && lanca_robo
+        fi
+      elif [ "$(idade_log)" -gt "$TRAVADO" ]; then
+        log "robo sem progresso ha $(( $(idade_log)/60 )) min - matando e reiniciando tudo"
+        mata_robo; sobe_comfy && lanca_robo
+      fi
+    else
+      if [ "$relancadas" -lt "$MAX_RELANCA" ]; then
+        log "robo nao esta rodando e o filme nao terminou"
+        garante_comfy && lanca_robo
+      elif [ "$relancadas" -eq "$MAX_RELANCA" ]; then
+        log "DESISTI: $MAX_RELANCA relancadas sem progresso - olhe $ROBO_OUT e relance na mao"; relancadas=$((relancadas+1))
+      fi
+    fi
+  fi
+
+  # backup: de hora em hora, e na hora em que o rclone.conf aparecer
+  agora=$(date +%s)
+  if [ -f "$CONF" ] && [ "$tinha_conf" -eq 0 ]; then tinha_conf=1; ultimo_backup=0; log "rclone.conf encontrado - backup no Drive ligado"; fi
+  if [ $((agora-ultimo_backup)) -ge $BACKUP ]; then backup; ultimo_backup=$agora; fi
+
+  # fim do filme: ultimo backup e parada da instancia (uma vez so)
+  if [ "$fim_tratado" -eq 0 ] && [ -f "$ROBO_LOG" ] && terminou && ! robo_vivo; then
+    fim_tratado=1
+    log "FIM detectado - fazendo o backup final"
+    if ! tem_drive; then
+      log "sem Drive configurado: nada a salvar, instancia continua ligada (pare pelo painel)"
+    elif ! backup; then
+      log "backup final com erro - NAO vou parar a instancia; confira o Drive"
+    elif rodada_completa; then
+      para_instancia
+    else
+      log "rodada parcial (teste --apenas ou --refazer): instancia continua ligada"
+    fi
+  fi
+
+  sleep $CHECA
+done
+EOF_VIGIA
+chmod +x /workspace/scripts/vigia.sh
+
+echo "[boot] (8/9) Subindo o ComfyUI..."
 cd /workspace/ComfyUI
 pkill -f "main.py --listen" || true; sleep 2
 nohup python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header > /workspace/logs/comfyui.log 2>&1 &
+
+echo "[boot] (9/9) Subindo o VIGIA (relanca o robo, reinicia o ComfyUI, backup no Drive)..."
+pkill -f "scripts/vigia.sh" || true; sleep 1
+nohup setsid bash /workspace/scripts/vigia.sh > /workspace/logs/vigia.out 2>&1 &
+[ -f /workspace/projeto/rclone.conf ] && echo "[boot]   rclone.conf encontrado: backup no Drive ligado" || echo "[boot]   sem /workspace/projeto/rclone.conf: backup no Drive DESLIGADO (suba o arquivo em projeto/)"
 df -h /workspace | tail -1
 echo "[boot] PRONTO. Leia o /workspace/LEIA-ME-ROBO.txt e suba os arquivos do projeto."
