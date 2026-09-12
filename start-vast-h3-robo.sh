@@ -795,8 +795,8 @@ Antes de rodar, arraste para as pastas:
   /workspace/projeto/wf_abertura.json     (se o boot avisou que falta)
   /workspace/projeto/wf_continuacao.json  (se o boot avisou que falta)
   /workspace/projeto/rclone.conf          (token do Google Drive; sem ele o backup fica desligado)
-  /workspace/projeto/vast_api_key.txt     (OPCIONAL: chave de API da Vast; com ele o vigia PARA a
-                                           instancia sozinho quando o filme termina)
+  /workspace/projeto/vast_api_key.txt     (chave de API da Vast: com ele o vigia REINICIA a instancia
+                                           se a GPU falhar e PARA ela quando o filme termina)
 
 Conferir tudo (nao gera nada):
   cd /workspace && python3 scripts/robo_h3.py --validar
@@ -824,6 +824,9 @@ VIGIA (ja sobe sozinho no boot; log em /workspace/logs/vigia.log):
       /workspace/projeto -> gdrive:H3/projeto  (prompts, imagens, vozes; chaves NAO vao)
   - no FIM de uma rodada completa: backup final e, se existir vast_api_key.txt, PARA a instancia
     (rodada parcial - teste --apenas ou --refazer - nao para)
+  - GPU em falha (ComfyUI nao sobe, erro de CUDA): pede REBOOT da instancia a Vast (precisa do
+    vast_api_key.txt). Max 3 reboots em 6h; depois faz backup final e PARA a instancia = placa
+    ruim, alugue outra maquina e suba o rclone.conf que o vigia restaura tudo do Drive.
   POD NOVO DEPOIS DE PERDER A INSTANCIA: suba SO o rclone.conf em /workspace/projeto/ e espere.
     Em ate 5 min o vigia restaura tudo do Drive e relanca o robo sozinho, de onde parou.
   ATENCAO: ao comecar um FILME NOVO, renomeie antes as pastas H3/filme e H3/projeto no Drive
@@ -836,13 +839,16 @@ EOF_LEIA
 
 cat > /workspace/scripts/vigia.sh << 'EOF_VIGIA'
 #!/bin/bash
-# vigia.sh (v3) - vigia do robo H3. Fica ligado desde o boot e, a cada 5 min:
+# vigia.sh (v4) - vigia do robo H3. Fica ligado desde o boot e, a cada 5 min:
 #   - se o robo caiu e a rodada nao terminou, relanca (retoma de onde parou)
 #   - se o ComfyUI parou de responder (com ou sem robo vivo), reinicia ele e relanca o robo
 #   - se o robo ficar 60 min sem progresso, mata e reinicia tudo
 #   - restaura projeto e clipes do Drive quando o disco esta vazio (pod novo)
 #   - backup de hora em hora no Drive (e na hora, assim que o rclone.conf aparece)
 #   - no FIM do filme: ultimo backup e, se existir vast_api_key.txt, para a instancia
+#   - GPU em falha (ComfyUI nao sobe 2x seguidas com erro de CUDA): pede REBOOT da instancia
+#     pela API da Vast (precisa do vast_api_key.txt); max 3 reboots em 6h, depois faz o backup
+#     final e PARA a instancia (placa ruim - alugue outra maquina e retome pelo Drive)
 # Regra: a PRIMEIRA largada do robo e sua (cd /workspace && nohup python3 scripts/robo_h3.py ...).
 # O vigia so relanca sozinho quando ja existe um robo.log, ou seja, uma rodada ja comecou.
 LOG=/workspace/logs/vigia.log
@@ -858,6 +864,9 @@ BACKUP=3600      # backup a cada 60 min
 TRAVADO=3600     # 60 min sem progresso = travado
 ESPERA_COMFY=300 # espera ate 5 min o ComfyUI responder antes de reinicia-lo
 MAX_RELANCA=3    # relancadas seguidas sem progresso antes de desistir
+MAX_REBOOTS=3    # reboots pedidos a Vast dentro de JANELA_REBOOT antes de desistir da placa
+JANELA_REBOOT=21600
+REBOOTS_ARQ=/workspace/logs/reboots.txt   # sobrevive ao reboot: 1 timestamp por linha
 
 log(){ echo "[$(date '+%d/%m %H:%M')] $*" >> "$LOG"; }
 robo_vivo(){ pgrep -f "python3 scripts/robo_h3.py" >/dev/null; }
@@ -881,6 +890,27 @@ sobe_comfy(){
   log "ERRO: ComfyUI nao voltou em 5 min"; return 1
 }
 garante_comfy(){ comfy_ok && return 0; espera_comfy && return 0; sobe_comfy; }
+gpu_com_falha(){ grep -qiE "CUDA unknown error|CUDA not available|no CUDA-capable|CUDA error|CUDA driver" /workspace/logs/comfy.out 2>/dev/null; }
+vast_id(){ local id=$(hostname | sed -n 's/^C\.\([0-9]\+\)$/\1/p'); [ -z "$id" ] && id="$CONTAINER_ID"; echo "$id"; }
+vast_api(){  # vast_api METODO CAMINHO [JSON]
+  local key=$(tr -d ' \r\n' < "$VAST_KEY")
+  curl -s -m 30 -X "$1" "https://console.vast.ai/api/v0$2" -H "Authorization: Bearer $key" -H "Content-Type: application/json" ${3:+-d "$3"}
+}
+reboots_recentes(){ local agora=$(date +%s); [ -f "$REBOOTS_ARQ" ] && awk -v a="$agora" -v j="$JANELA_REBOOT" 'a-$1<j' "$REBOOTS_ARQ" | wc -l || echo 0; }
+pede_reboot(){
+  [ -f "$VAST_KEY" ] || { log "GPU em falha e sem $VAST_KEY: nao consigo pedir reboot - reinicie pelo painel da Vast"; return 1; }
+  local n=$(reboots_recentes)
+  if [ "$n" -ge "$MAX_REBOOTS" ]; then
+    log "GPU em falha pela ${n}a vez em 6h: placa ruim. Backup final e PARANDO a instancia - alugue outra e suba o rclone.conf"
+    backup; para_instancia; sleep 600; return 1
+  fi
+  local id=$(vast_id); [ -z "$id" ] && { log "ERRO: nao descobri o ID da instancia; reinicie pelo painel"; return 1; }
+  date +%s >> "$REBOOTS_ARQ"
+  log "GPU em falha (ComfyUI nao sobe, erro de CUDA) - pedindo REBOOT da instancia $id a Vast (reboot $((n+1))/$MAX_REBOOTS em 6h)"
+  local resp=$(vast_api PUT "/instances/reboot/$id/" '{}')
+  log "resposta da Vast: ${resp:0:200}"
+  sleep 600   # o reboot derruba este processo; se nao derrubar, o loop continua e tenta de novo
+}
 mata_robo(){ pkill -f "python3 scripts/robo_h3.py"; sleep 3; }
 lanca_robo(){
   cd /workspace && nohup python3 scripts/robo_h3.py >> "$ROBO_OUT" 2>&1 &
@@ -933,17 +963,14 @@ rodada_completa(){
   [ -n "$oks" ] && [ -n "$fal" ] && [ -n "$tot" ] && [ $((oks+fal)) -ge "$tot" ]
 }
 para_instancia(){
-  [ -f "$VAST_KEY" ] || { log "filme terminou; sem $VAST_KEY, a instancia fica ligada (pare pelo painel)"; return; }
-  local key=$(tr -d ' \r\n' < "$VAST_KEY")
-  local id=$(hostname | sed -n 's/^C\.\([0-9]\+\)$/\1/p'); [ -z "$id" ] && id="$CONTAINER_ID"
-  [ -z "$id" ] && { log "ERRO: nao descobri o ID da instancia; pare pelo painel"; return; }
-  log "filme terminou e backup final ok - pedindo a Vast pra PARAR a instancia $id"
-  local resp=$(curl -s -m 30 -X PUT "https://console.vast.ai/api/v0/instances/$id/" \
-    -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d '{"state":"stopped"}')
+  [ -f "$VAST_KEY" ] || { log "sem $VAST_KEY, a instancia fica ligada (pare pelo painel)"; return; }
+  local id=$(vast_id); [ -z "$id" ] && { log "ERRO: nao descobri o ID da instancia; pare pelo painel"; return; }
+  log "pedindo a Vast pra PARAR a instancia $id"
+  local resp=$(vast_api PUT "/instances/$id/" '{"state":"stopped"}')
   log "resposta da Vast: ${resp:0:200}"
 }
 
-relancadas=0; ultimo_backup=0; restaurado=0; tinha_conf=0; fim_tratado=0
+relancadas=0; ultimo_backup=0; restaurado=0; tinha_conf=0; fim_tratado=0; falhas_comfy=0
 log "vigia iniciado - $(n_clipes) clipes no disco"
 ultimo_n=$(n_clipes)
 # um FIM que ja existia quando o vigia subiu nao e novidade: nao para a instancia por causa dele
@@ -961,20 +988,27 @@ while true; do
       if ! comfy_ok; then
         log "ComfyUI parou de responder com o robo vivo"
         if ! espera_comfy; then
-          mata_robo; sobe_comfy && lanca_robo
+          mata_robo
+          if sobe_comfy; then falhas_comfy=0; lanca_robo; else falhas_comfy=$((falhas_comfy+1)); fi
         fi
       elif [ "$(idade_log)" -gt "$TRAVADO" ]; then
         log "robo sem progresso ha $(( $(idade_log)/60 )) min - matando e reiniciando tudo"
-        mata_robo; sobe_comfy && lanca_robo
+        mata_robo
+        if sobe_comfy; then falhas_comfy=0; lanca_robo; else falhas_comfy=$((falhas_comfy+1)); fi
       fi
     else
       if [ "$relancadas" -lt "$MAX_RELANCA" ]; then
         log "robo nao esta rodando e o filme nao terminou"
-        garante_comfy && lanca_robo
+        if garante_comfy; then falhas_comfy=0; lanca_robo; else falhas_comfy=$((falhas_comfy+1)); fi
       elif [ "$relancadas" -eq "$MAX_RELANCA" ]; then
         log "DESISTI: $MAX_RELANCA relancadas sem progresso - olhe $ROBO_OUT e relance na mao"; relancadas=$((relancadas+1))
       fi
     fi
+  fi
+
+  # GPU em falha: ComfyUI nao sobe 2x seguidas (ou 1x com erro de CUDA explicito) -> reboot pela Vast
+  if [ "$falhas_comfy" -ge 2 ] || { [ "$falhas_comfy" -ge 1 ] && gpu_com_falha; }; then
+    pede_reboot && falhas_comfy=0
   fi
 
   # backup: de hora em hora, e na hora em que o rclone.conf aparecer
